@@ -22,6 +22,7 @@ constexpr uint64_t kMaxHeaderBytes = 16ull << 20;
 constexpr uint64_t kMaxMetadataItems = 1ull << 20;
 constexpr uint64_t kMaxArrayItems = 1ull << 20;
 constexpr uint32_t kMaxSplitCount = 4096;
+constexpr uint64_t kMoeUploadBatchCapacity = 8;
 
 constexpr uint64_t align_up(uint64_t offset, uint64_t alignment) {
     return (offset + alignment - 1) & ~(alignment - 1);
@@ -865,7 +866,7 @@ ModelInfo parse_model_info(Reader r, const std::string & path, uint64_t file_byt
                     const uint64_t g_min = align_up(g.gate.nb2 * (slots_min + 1), 1024ull) +
                                            align_up(g.up.nb2   * (slots_min + 1), 1024ull) +
                                            align_up(g.down.nb2 * (slots_min + 1), 1024ull);
-                    const uint64_t staging = std::max({ g.gate.nb2, g.up.nb2, g.down.nb2 });
+                    const uint64_t staging = std::max({ g.gate.nb2, g.up.nb2, g.down.nb2 }) * kMoeUploadBatchCapacity;
                     group_bytes_sum += g_min + staging;
                     max_slice_bytes = std::max({ max_slice_bytes, g.gate.nb2, g.up.nb2, g.down.nb2 });
                 }
@@ -1155,6 +1156,7 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
             return p;
         }
 
+        // Keep the configured cache budget fixed; only context and KV type vary below.
         const uint64_t cache_bytes = (uint64_t) moe_cache_mib * (1024ull * 1024ull);
         if (cache_bytes < m.moe_cache_min_bytes) {
             p.fits = false;
@@ -1170,10 +1172,11 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
 
         const double non_expert_weights_gib = (double) m.non_expert_bytes / kGiB;
         const double moe_cache_gib = (double) moe_cache_mib / 1024.0;
-        const double staging_gib = (double) std::max<uint64_t>(m.moe_max_expert_slice_bytes * 2, 64ull << 20) / kGiB;
+        const double staging_gib = (double) std::max<uint64_t>(m.moe_max_expert_slice_bytes * kMoeUploadBatchCapacity * 2ull, 64ull << 20) / kGiB;
         const double effective_weights_gib = non_expert_weights_gib + moe_cache_gib;
         const double paged_reserve_gib = 0.75 + p.state_gib + staging_gib;
 
+        // Use the selected profile and caps unchanged. Long-context mode backs down only when a candidate does not fit.
         const std::vector<PlanCandidate> paged_candidates = enumerate_candidates(
             m, effective_weights_gib, p.state_gib, paged_reserve_gib, ctx_cap, kv_force, profile);
         const PlanCandidate * paged_selected = nullptr;

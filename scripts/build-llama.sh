@@ -61,6 +61,7 @@ std_libs="$compat_dir/libps5compat.a $mbedtls/lib/libmbedtls.a $mbedtls/lib/libm
 std_libs="$std_libs $mbedtls/lib/libmbedcrypto.a $mbedtls/lib/libeverest.a $mbedtls/lib/libp256m.a"
 
 "$PS5_PAYLOAD_SDK/bin/prospero-cmake" -S "$root/ps5" -B "$out" -G Ninja \
+    -DPS5LM_MOE_SOURCE_DIR="$root/ps5/moe" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_C_FLAGS="$ps5_flags" \
     -DCMAKE_CXX_FLAGS="$ps5_flags" \

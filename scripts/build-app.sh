@@ -81,6 +81,7 @@ cxxflags="$flags -fexceptions -fcxx-exceptions -frtti"
 mkdir -p "$out"
 cmake -S "$llama" -B "$out/llama" -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE="$root/ps5/app/toolchain.cmake" \
+    -DPS5LM_MOE_SOURCE_DIR="$root/ps5/moe" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_C_FLAGS="$flags" -DCMAKE_CXX_FLAGS="$cxxflags" \
     -DBUILD_SHARED_LIBS=OFF -DGGML_BACKEND_DL=OFF -DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=OFF \

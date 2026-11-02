@@ -91,28 +91,58 @@ bool same_identity(const FileIdentity & a, const FileIdentity & b) noexcept {
     return a.available && b.available && a.device == b.device && a.inode == b.inode;
 }
 
+#ifdef PS5LM_MOE_EXPERT_SOURCE_TESTING
+int checked_fstat(
+        int fd,
+        struct stat * output,
+        OpenOptions::FstatFunction test_function,
+        void * user_data) noexcept {
+    return test_function ? test_function(fd, output, user_data) : ::fstat(fd, output);
+}
+
+int checked_stat(
+        const char * path,
+        struct stat * output,
+        OpenOptions::StatFunction test_function,
+        void * user_data) noexcept {
+    return test_function ? test_function(path, output, user_data) : ::stat(path, output);
+}
+#else
+int checked_fstat(int fd, struct stat * output) noexcept {
+    return ::fstat(fd, output);
+}
+
+int checked_stat(const char * path, struct stat * output) noexcept {
+    return ::stat(path, output);
+}
+#endif
+
 ReadError validate_current_file(
         int fd,
         const char * path,
         std::uint64_t expected_size,
-        const FileIdentity & opened_identity) noexcept {
-    struct stat fd_stat{};
-    if (::fstat(fd, &fd_stat) != 0) {
-        return make_error(ReadStatus::IoError, errno, "fstat failed for expert shard");
-    }
-    if (fd_stat.st_size < 0 || static_cast<std::uint64_t>(fd_stat.st_size) != expected_size) {
-        return make_error(ReadStatus::FileChanged, 0, "expert shard size changed");
-    }
-
-    FileIdentity current_fd_identity;
-    if (identity_from_stat(fd_stat, current_fd_identity) && opened_identity.available &&
-            !same_identity(current_fd_identity, opened_identity)) {
-        return make_error(ReadStatus::FileChanged, 0, "open expert shard identity changed");
-    }
-
+#ifdef PS5LM_MOE_EXPERT_SOURCE_TESTING
+        const FileIdentity & opened_identity,
+        OpenOptions::StatFunction stat_for_test,
+        OpenOptions::FstatFunction fstat_for_test,
+        void * metadata_user_data
+#else
+        const FileIdentity & opened_identity
+#endif
+        ) noexcept {
+    // For an identity-backed shard, stat(path) alone checks both that the
+    // name still resolves to the retained handle's file and that this inode's
+    // size is unchanged. Doing fstat(fd) as well would repeat the same size
+    // check. If the filesystem supplies no identity, keep the fd-size check;
+    // that is the existing fail-closed behavior available on such filesystems.
     if (opened_identity.available) {
         struct stat path_stat{};
-        if (::stat(path, &path_stat) != 0) {
+#ifdef PS5LM_MOE_EXPERT_SOURCE_TESTING
+        const int stat_result = checked_stat(path, &path_stat, stat_for_test, metadata_user_data);
+#else
+        const int stat_result = checked_stat(path, &path_stat);
+#endif
+        if (stat_result != 0) {
             return make_error(ReadStatus::FileChanged, errno, "expert shard path is no longer available");
         }
         FileIdentity current_path_identity;
@@ -122,6 +152,19 @@ ReadError validate_current_file(
         }
         if (path_stat.st_size < 0 || static_cast<std::uint64_t>(path_stat.st_size) != expected_size) {
             return make_error(ReadStatus::FileChanged, 0, "expert shard path size changed");
+        }
+    } else {
+        struct stat fd_stat{};
+#ifdef PS5LM_MOE_EXPERT_SOURCE_TESTING
+        const int fstat_result = checked_fstat(fd, &fd_stat, fstat_for_test, metadata_user_data);
+#else
+        const int fstat_result = checked_fstat(fd, &fd_stat);
+#endif
+        if (fstat_result != 0) {
+            return make_error(ReadStatus::IoError, errno, "fstat failed for expert shard");
+        }
+        if (fd_stat.st_size < 0 || static_cast<std::uint64_t>(fd_stat.st_size) != expected_size) {
+            return make_error(ReadStatus::FileChanged, 0, "expert shard size changed");
         }
     }
 
@@ -160,6 +203,11 @@ OpenResult ExpertSource::open(
         source->max_expert_bytes_ = options.max_expert_bytes;
         source->shards_.resize(shard_paths.size());
         source->tensors_ = tensor_descriptors;
+#ifdef PS5LM_MOE_EXPERT_SOURCE_TESTING
+        source->stat_for_test_ = options.stat_for_test;
+        source->fstat_for_test_ = options.fstat_for_test;
+        source->metadata_user_data_ = options.metadata_user_data;
+#endif
 
         for (std::size_t i = 0; i < shard_paths.size(); ++i) {
             if (shard_paths[i].path.empty() || shard_paths[i].path.size() > kMaxPathBytes ||
@@ -235,7 +283,11 @@ OpenResult ExpertSource::open(
             shard.handle = FileHandle(fd);
 
             struct stat fd_stat{};
-            if (::fstat(fd, &fd_stat) != 0) {
+#ifdef PS5LM_MOE_EXPERT_SOURCE_TESTING
+            if (checked_fstat(fd, &fd_stat, options.fstat_for_test, options.metadata_user_data) != 0) {
+#else
+            if (checked_fstat(fd, &fd_stat) != 0) {
+#endif
                 return open_failure(ReadStatus::IoError, errno, "fstat failed while opening expert shard");
             }
             if (!S_ISREG(fd_stat.st_mode)) {
@@ -251,7 +303,11 @@ OpenResult ExpertSource::open(
             }
 
             struct stat path_stat{};
-            if (::stat(shard.path.c_str(), &path_stat) != 0) {
+#ifdef PS5LM_MOE_EXPERT_SOURCE_TESTING
+            if (checked_stat(shard.path.c_str(), &path_stat, options.stat_for_test, options.metadata_user_data) != 0) {
+#else
+            if (checked_stat(shard.path.c_str(), &path_stat) != 0) {
+#endif
                 return open_failure(ReadStatus::IoError, errno, "stat failed while opening expert shard");
             }
             if (path_stat.st_size < 0 || static_cast<std::uint64_t>(path_stat.st_size) != shard.expected_size) {
@@ -318,7 +374,15 @@ ReadError ExpertSource::read_expert(
     }
 
     const Shard & shard = shards_[it->shard_index];
-    ReadError file_status = validate_current_file(shard.handle.value, shard.path.c_str(), shard.expected_size, shard.opened_identity);
+    ReadError file_status;
+#ifdef PS5LM_MOE_EXPERT_SOURCE_TESTING
+    file_status = validate_current_file(
+            shard.handle.value, shard.path.c_str(), shard.expected_size, shard.opened_identity,
+            stat_for_test_, fstat_for_test_, metadata_user_data_);
+#else
+    file_status = validate_current_file(
+            shard.handle.value, shard.path.c_str(), shard.expected_size, shard.opened_identity);
+#endif
     if (!file_status.ok()) {
         return file_status;
     }

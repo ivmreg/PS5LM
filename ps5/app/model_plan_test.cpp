@@ -294,7 +294,7 @@ int main(int argc, char ** argv) {
     assert(qm.expert_bytes == 17553162240ull);
     assert(qm.non_expert_bytes == 1003524096ull);
     assert(qm.moe_max_expert_slice_bytes == 1290240ull);
-    assert(qm.moe_cache_min_bytes == 53649408ull); // ~51.16 MiB
+    assert(qm.moe_cache_min_bytes == 68874240ull); // ~65.68 MiB
 
     // Resident mode (allow_paged_moe = false) on budget = 11.38 GiB: does NOT fit
     const ps5lm::Plan res_moe_plan = ps5lm::plan_model(qm, budget);
@@ -304,16 +304,59 @@ int main(int argc, char ** argv) {
     const ps5lm::Plan paged_plan = ps5lm::plan_model(qm, budget, 65536, nullptr, "long_context", true, 2048);
     assert(paged_plan.fits && paged_plan.paged_moe);
     assert(paged_plan.moe_cache_mib == 2048);
+    assert(std::fabs(paged_plan.moe_cache_gib - 2.0) < 0.001);
+    assert(std::fabs(paged_plan.weights_gib - (double) qm.non_expert_bytes / 1073741824.0) < 0.001);
+    assert(std::fabs(paged_plan.total_gib - (paged_plan.weights_gib + paged_plan.moe_cache_gib +
+           paged_plan.kv_gib + paged_plan.state_gib + paged_plan.reserve_gib)) < 0.001);
+    assert(paged_plan.total_gib <= budget);
     assert(has_args(paged_plan, "-ub", "1"));
     assert(has_args(paged_plan, "-np", "1"));
     assert(has_args(paged_plan, "--moe-cache-mib", "2048"));
     assert(std::find(paged_plan.args.begin(), paged_plan.args.end(), "--paged-moe") != paged_plan.args.end());
     assert(paged_plan.why.find("paged MoE (2048 MiB cache)") == 0);
 
-    // Insufficient cache budget (moe_cache_mib = 16 MiB < 52 MiB minimum): fits == false
+    // A resident fit stays resident even when paging is enabled and the cache request is too small.
+    ps5lm::ModelInfo resident_moe = qm;
+    resident_moe.file_bytes = 1ull << 30;
+    resident_moe.non_expert_bytes = 1ull << 29;
+    resident_moe.expert_bytes = 1ull << 29;
+    resident_moe.n_ctx_train = 8192;
+    const ps5lm::Plan resident_only = ps5lm::plan_model(resident_moe, budget, 65536);
+    const ps5lm::Plan resident_with_paging = ps5lm::plan_model(resident_moe, budget, 65536, nullptr,
+                                                               "long_context", true, 16);
+    assert(resident_only.fits && !resident_only.paged_moe);
+    assert(resident_with_paging.fits && !resident_with_paging.paged_moe);
+    assert(resident_with_paging.args == resident_only.args && resident_with_paging.ctx == resident_only.ctx &&
+           resident_with_paging.kv_type == resident_only.kv_type &&
+           std::fabs(resident_with_paging.total_gib - resident_only.total_gib) < 0.001);
+
+    // Paged mode preserves profile ordering and the effective user/model context caps.
+    const ps5lm::Plan paged_long_context = ps5lm::plan_model(qm, budget, 65536, nullptr, "long_context", true, 2048);
+    const ps5lm::Plan paged_balanced = ps5lm::plan_model(qm, budget, 65536, nullptr, "balanced", true, 2048);
+    const ps5lm::Plan paged_precision = ps5lm::plan_model(qm, budget, 65536, nullptr, "kv_precision", true, 2048);
+    assert(paged_long_context.fits && paged_long_context.ctx == 32768 && paged_long_context.kv_type == "q8_0");
+    assert(paged_balanced.fits && paged_balanced.ctx == 16384 && paged_balanced.kv_type == "q8_0");
+    assert(paged_precision.fits && paged_precision.ctx == 32768 && paged_precision.kv_type == "f16");
+
+    const ps5lm::Plan paged_user_cap = ps5lm::plan_model(qm, budget, 8192, "q8_0", "long_context", true, 2048);
+    assert(paged_user_cap.fits && paged_user_cap.ctx == 8192 && paged_user_cap.kv_type == "q8_0");
+
+    // The explicit GPU cache budget remains exact when changed; it is not traded for context.
+    const ps5lm::Plan larger_cache_plan = ps5lm::plan_model(qm, budget, 65536, nullptr, "long_context", true, 3072);
+    assert(larger_cache_plan.fits && larger_cache_plan.moe_cache_mib == 3072);
+    assert(has_args(larger_cache_plan, "--moe-cache-mib", "3072"));
+    assert(larger_cache_plan.ctx == paged_long_context.ctx && larger_cache_plan.kv_type == paged_long_context.kv_type);
+    assert(std::fabs(larger_cache_plan.total_gib - paged_long_context.total_gib - 1.0) < 0.001);
+
+    // Insufficient cache budget (moe_cache_mib = 16 MiB < 66 MiB minimum): fits == false
     const ps5lm::Plan low_cache_plan = ps5lm::plan_model(qm, budget, 65536, nullptr, "long_context", true, 16);
     assert(!low_cache_plan.fits);
     assert(low_cache_plan.why.find("minimum required") != std::string::npos);
+
+    // A valid cache cannot make a plan fit when even the smallest context exceeds free memory.
+    const ps5lm::Plan insufficient_memory = ps5lm::plan_model(qm, 3.0, 4096, "q4_0", "long_context", true, 2048);
+    assert(!insufficient_memory.fits && insufficient_memory.args.empty());
+    assert(insufficient_memory.total_gib > 3.0);
 
     // 2. Split GGUF rejection in paged mode
     Gguf split_moe_g;
@@ -343,7 +386,7 @@ int main(int argc, char ** argv) {
     assert(tiny.expert_bytes == 49152);
     assert(tiny.file_bytes == 156640);
     assert(tiny.non_expert_bytes == 107488);
-    assert(tiny.moe_cache_min_bytes == 22528);
+    assert(tiny.moe_cache_min_bytes == 36864);
     assert(tiny.moe_max_expert_slice_bytes == 2048);
 
     // =========================================================================

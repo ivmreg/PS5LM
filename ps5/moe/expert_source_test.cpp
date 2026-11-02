@@ -94,6 +94,34 @@ struct ReadScript {
     std::size_t bytes_requested = 0;
 };
 
+struct MetadataScript {
+    int stat_calls = 0;
+    int fstat_calls = 0;
+    bool report_identity_unavailable = false;
+
+    void reset() {
+        stat_calls = 0;
+        fstat_calls = 0;
+    }
+};
+
+int counted_stat(const char * path, struct stat * output, void * user_data) {
+    auto * script = static_cast<MetadataScript *>(user_data);
+    ++script->stat_calls;
+    return ::stat(path, output);
+}
+
+int counted_fstat(int fd, struct stat * output, void * user_data) {
+    auto * script = static_cast<MetadataScript *>(user_data);
+    ++script->fstat_calls;
+    const int result = ::fstat(fd, output);
+    if (result == 0 && script->report_identity_unavailable) {
+        output->st_dev = 0;
+        output->st_ino = 0;
+    }
+    return result;
+}
+
 ssize_t scripted_pread(int fd, void * output, std::size_t count, off_t offset, void * user_data) {
     auto * script = static_cast<ReadScript *>(user_data);
     const int call = script->calls++;
@@ -307,6 +335,51 @@ void test_identity_mismatch_and_open_length_mismatch() {
     expect_status(opened.error, ReadStatus::FileChanged);
 }
 
+void test_read_validation_uses_one_path_check_when_identity_is_available() {
+    Fixture fixture;
+    MetadataScript metadata;
+    OpenOptions options;
+    options.max_expert_bytes = 8;
+    options.stat_for_test = counted_stat;
+    options.fstat_for_test = counted_fstat;
+    options.metadata_user_data = &metadata;
+    OpenResult opened = fixture.open(options);
+    assert(opened.ok());
+
+    metadata.reset();
+    std::array<std::uint8_t, 4> bytes{};
+    const ReadError error = opened.source->read_expert(11, 1, bytes.data(), bytes.size());
+    assert(error.ok());
+    assert((bytes == std::array<std::uint8_t, 4>{9, 10, 11, 12}));
+    assert(metadata.stat_calls == 1);
+    assert(metadata.fstat_calls == 0);
+}
+
+void test_read_validation_keeps_fd_size_check_without_identity() {
+    Fixture fixture;
+    MetadataScript metadata;
+    metadata.report_identity_unavailable = true;
+    OpenOptions options;
+    options.max_expert_bytes = 8;
+    options.stat_for_test = counted_stat;
+    options.fstat_for_test = counted_fstat;
+    options.metadata_user_data = &metadata;
+    std::vector<ExpertTensorDescriptor> descriptors = fixture.descriptors();
+    for (ExpertTensorDescriptor & descriptor : descriptors) {
+        descriptor.expected_identity = {};
+    }
+    OpenResult opened = ExpertSource::open(fixture.shards(), descriptors, options);
+    assert(opened.ok());
+
+    metadata.reset();
+    std::array<std::uint8_t, 4> bytes{};
+    const ReadError error = opened.source->read_expert(11, 1, bytes.data(), bytes.size());
+    assert(error.ok());
+    assert((bytes == std::array<std::uint8_t, 4>{9, 10, 11, 12}));
+    assert(metadata.stat_calls == 0);
+    assert(metadata.fstat_calls == 1);
+}
+
 void test_truncation_and_path_replacement_after_open() {
     {
         Fixture fixture;
@@ -379,6 +452,8 @@ int main() {
     test_cancellation();
     test_descriptor_and_buffer_validation();
     test_identity_mismatch_and_open_length_mismatch();
+    test_read_validation_uses_one_path_check_when_identity_is_available();
+    test_read_validation_keeps_fd_size_check_without_identity();
     test_truncation_and_path_replacement_after_open();
     test_no_source_mmap_or_unbounded_read_contract();
     test_rejects_non_regular_and_embedded_nul_paths();

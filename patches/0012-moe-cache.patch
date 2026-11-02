@@ -1,0 +1,1506 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 9ee64b5..a7f2cc0 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-context.h"
++#include "../ggml/src/ggml-backend-impl.h"
+ 
+ #include "ggml.h"
+ #include "llama-arch.h"
+@@ -178,6 +179,10 @@ llama_context::llama_context(
+     //     may need to be backend-dependent
+     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
+ 
++    if (model.has_paged_experts) {
++        cparams.moe_paged = true;
++    }
++
+     t_start_us = model.t_start_us;
+     t_load_us  = model.t_load_us;
+ 
+@@ -360,6 +365,26 @@ llama_context::llama_context(
+     cparams.kv_unified     = params.kv_unified;
+     cparams.moe_cache_size = params.moe_cache_size;
+ 
++    if (model.has_paged_experts) {
++        cparams.moe_paged = true;
++        if (params.n_ubatch > 1) {
++            throw std::runtime_error("paged MoE requires n_ubatch <= 1");
++        }
++        if (params.n_seq_max > 1) {
++            throw std::runtime_error("paged MoE requires n_seq_max <= 1");
++        }
++        if (params.moe_cache_size == 0) {
++            throw std::runtime_error("paged MoE requires moe_cache_size > 0");
++        }
++        if (params.embeddings) {
++            throw std::runtime_error("paged MoE does not support embeddings mode");
++        }
++        if (!cparams.causal_attn) {
++            throw std::runtime_error("paged MoE requires causal attention");
++        }
++        cparams.n_ubatch = 1;
++    }
++
+     // initialized later
+     cparams.pipeline_parallel = false;
+     cparams.training = false;
+@@ -438,6 +463,24 @@ llama_context::llama_context(
+             }
+         }
+ 
++        if (model.has_paged_experts && model.devices.empty()) {
++            backend_paged_cpu.reset(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
++            if (backend_paged_cpu == nullptr) {
++                throw std::runtime_error("failed to initialize paged CPU backend");
++            }
++            dev_paged_cpu = std::make_unique<ggml_backend_device>(*backend_paged_cpu->device);
++            dev_paged_cpu->context = backend_paged_cpu->device;
++            dev_paged_cpu->iface.supports_buft = [](ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) -> bool {
++                if (buft && strcmp(ggml_backend_buft_name(buft), "SLOT_MAP_HOST") == 0) {
++                    return false;
++                }
++                ggml_backend_dev_t orig_dev = static_cast<ggml_backend_dev_t>(dev->context);
++                return orig_dev->iface.supports_buft(orig_dev, buft);
++            };
++            backend_paged_cpu->device = dev_paged_cpu.get();
++            backends.emplace_back(std::move(backend_paged_cpu));
++        }
++
+         // add CPU backend
+         backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+         if (backend_cpu == nullptr) {
+@@ -593,6 +636,10 @@ llama_context::~llama_context() {
+             }
+         }
+     }
++    if (dev_paged_cpu && dev_paged_cpu->context && !backends.empty() && backends[0]) {
++        backends[0]->device = static_cast<ggml_backend_dev_t>(dev_paged_cpu->context);
++        dev_paged_cpu->context = nullptr;
++    }
+     ggml_opt_free(opt_ctx);
+ }
+ 
+@@ -603,7 +650,7 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+             return;
+         }
+ 
+-        const uint32_t n_tokens_probe = probe.n_tokens_per_seq*n_seqs;
++        const uint32_t n_tokens_probe = cparams.moe_paged ? 1 : (probe.n_tokens_per_seq*n_seqs);
+ 
+         auto * gf = graph_reserve(n_tokens_probe, n_seqs, n_tokens_probe, mctx, true);
+         if (!gf) {
+@@ -624,6 +671,9 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+             // TODO: make this descriptor-specific; model.dev_layer() preserves the current behavior,
+             // but is still wrong for cases like --no-kv-offload.
+             ggml_backend_dev_t device_layer = model.dev_layer(node.il);
++            if (device_fused && dev_paged_cpu && device_fused == dev_paged_cpu.get()) {
++                device_fused = static_cast<ggml_backend_dev_t>(dev_paged_cpu->context);
++            }
+ 
+             if (device_fused != device_layer) {
+                 LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but %s "
+@@ -708,7 +758,11 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
+     sched.reset(ggml_backend_sched_new(
+             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
+ 
+-    ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
++    if (cparams.moe_paged) {
++        ggml_backend_sched_set_copy_callback_v2(sched.get(), sched_copy_experts_v2, this);
++    } else {
++        ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
++    }
+     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
+ }
+ 
+@@ -875,6 +929,10 @@ void llama_context::synchronize() {
+ 
+     ggml_backend_sched_synchronize(sched.get());
+ 
++    if (moe_cache) {
++        moe_cache->complete_pending_paging();
++    }
++
+     // FIXME: if multiple single tokens are evaluated without a synchronization,
+     // the stats will be added to the prompt evaluation stats
+     // this should only happen when using batch size 1 to evaluate a batch
+@@ -1568,8 +1626,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+     }
+ 
+     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
++    if (cparams.moe_paged && sched) {
++        ggml_backend_sched_synchronize(sched.get());
++        if (moe_cache) {
++            moe_cache->complete_pending_paging();
++        }
++    }
+     if (status != GGML_STATUS_SUCCESS) {
+         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
++        if (moe_cache) {
++            moe_cache->complete_pending_paging();
++        }
+         ret = status;
+         return nullptr;
+     }
+@@ -2843,6 +2910,25 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+     return true;
+ }
+ 
++enum ggml_backend_sched_copy_result llama_context::sched_copy_experts_v2(
++        ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
++    auto * lctx = static_cast<llama_context *>(user_data);
++
++    if (lctx->moe_cache) {
++        auto res = lctx->moe_cache->copy_v2(backend, src, dst, graph);
++        if (res != GGML_BACKEND_SCHED_COPY_NOT_HANDLED) {
++            return res;
++        }
++    }
++
++    if (lctx->cparams.moe_paged) {
++        return GGML_BACKEND_SCHED_COPY_NOT_HANDLED;
++    }
++
++    bool ok = sched_copy_experts(backend, src, dst, graph, user_data);
++    return ok ? GGML_BACKEND_SCHED_COPY_HANDLED : GGML_BACKEND_SCHED_COPY_NOT_HANDLED;
++}
++
+ llm_graph_cb llama_context::graph_get_cb() const {
+     return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
+         if (il >= 0) {
+@@ -4211,6 +4297,16 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
+     ctx->set_warmup(warmup);
+ }
+ 
++llama_moe_cache * llama_context::get_moe_cache() const {
++    return moe_cache.get();
++}
++
++void llama_moe_set_fault_injection(llama_context * ctx, bool enable, int countdown) {
++    if (ctx && ctx->get_moe_cache()) {
++        ctx->get_moe_cache()->set_fault_injection(enable, countdown);
++    }
++}
++
+ void llama_synchronize(llama_context * ctx) {
+     ctx->synchronize();
+ }
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 6938fb1..6782598 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -75,6 +75,7 @@ struct llama_context {
+     uint32_t n_threads_batch() const;
+ 
+     llama_memory_t get_memory() const;
++    llama_moe_cache * get_moe_cache() const;
+ 
+     // return true if the memory was updated
+     bool memory_update(bool optimize);
+@@ -278,6 +279,7 @@ private:
+ 
+     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
+     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
++    static enum ggml_backend_sched_copy_result sched_copy_experts_v2(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
+ 
+     // ggml_backend_sched realloc callback, counts and traces the graph reallocations of this context
+     static void sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data);
+@@ -392,6 +394,8 @@ private:
+     int32_t n_reallocs_same = 0;
+     int32_t n_reallocs_diff = 0;
+ 
++    std::unique_ptr<struct ggml_backend_device> dev_paged_cpu;
++    ggml_backend_ptr backend_paged_cpu;
+     ggml_backend_t backend_cpu = nullptr;
+     std::vector<ggml_backend_ptr> backends;
+ 
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index f4eb181..4695063 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -56,6 +56,7 @@ struct llama_cparams {
+     bool training;           // set by llama_opt_init()
+ 
+     size_t moe_cache_size;
++    bool moe_paged = false;
+ 
+     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+ 
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index f69fe63..36420f0 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1536,7 +1536,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
+     n_embd_head_v    (hparams.n_embd_head_v()),
+     n_embd_v_gqa     (hparams.n_embd_v_gqa()),
+     n_expert         (hparams.n_expert),
+-    n_expert_used    (cparams.warmup ? hparams.n_expert : hparams.n_expert_used()),
++    n_expert_used    ((cparams.warmup && !cparams.moe_paged) ? hparams.n_expert : hparams.n_expert_used()),
+     freq_base        (cparams.rope_freq_base),
+     freq_scale       (cparams.rope_freq_scale),
+     ext_factor       (cparams.yarn_ext_factor),
+@@ -1659,6 +1659,9 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
+           ggml_tensor * w_s,
+           ggml_tensor * slots) const {
+     cur = build_hadamard_input(w, cur);
++    if (cparams.moe_paged && slots == nullptr) {
++        throw std::runtime_error("paged MoE requires cache slots; fallback to full expert tensor is forbidden");
++    }
+     // the experts in the MoE cache are selected by their slots
+     ggml_tensor * res = slots == nullptr ?
+         ggml_mul_mat_id(ctx0, w, cur, ids) :
+@@ -2497,19 +2500,27 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
+          ggml_tensor * gate_up_exps,
+                  int   il) const {
+     if (moe_cache == nullptr) {
++        if (cparams.moe_paged) {
++            throw std::runtime_error("paged MoE requires moe_cache");
++        }
+         return nullptr;
+     }
+ 
+     ggml_tensor * slot_map = moe_cache->get_slot_map(il, selected_experts->ne[1], selected_experts->ne[0]);
+     if (slot_map == nullptr) {
++        if (cparams.moe_paged) {
++            throw std::runtime_error(format("paged MoE layer %d slot_map is unavailable", il));
++        }
+         return nullptr;
+     }
+     for (ggml_tensor * w : { up_exps, gate_exps, down_exps, gate_up_exps }) {
+         if (w != nullptr && moe_cache->get_experts(w) == nullptr) {
++            if (cparams.moe_paged) {
++                throw std::runtime_error(format("paged MoE expert tensor %s lacks cache binding", w->name));
++            }
+             return nullptr;
+         }
+     }
+-
+     ggml_tensor * ids = selected_experts;
+     if (!ggml_is_contiguous(ids)) {
+         ids = ggml_cont(ctx0, ids);
+@@ -2520,6 +2531,9 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
+     // the callback reads the selected experts, uploads the missing ones and updates the slot map
+     ggml_tensor * slots = ggml_get_rows(ctx0, slot_map, ids); // [1, n_expert_used*n_tokens]
+     if (!ggml_backend_supports_op(moe_cache->backend(il), slots)) {
++        if (cparams.moe_paged) {
++            throw std::runtime_error(format("target backend does not support GET_ROWS on slot_map for layer %d", il));
++        }
+         return nullptr;
+     }
+     ggml_backend_sched_set_tensor_backend(sched, slots, moe_cache->backend(il));
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index f22d986..5ba44ad 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -4,14 +4,52 @@
+ #include "llama-model.h"
+ 
+ #include "ggml-cpp.h"
++#include "../ggml/src/ggml-backend-impl.h"
++
++#if !defined(_WIN32)
++#include "slot_cache.hpp"
++#include "paging_runtime.hpp"
++#endif
+ 
+ #include <algorithm>
++#include <cstdint>
++#include <cstring>
++#include <limits>
+ #include <stdexcept>
+ #include <unordered_map>
+ #include <vector>
+ 
++#if !defined(_WIN32)
++void llama_moe_cache_detail::rebuild_slot_map(
++        int32_t * slot_data,
++        int32_t n_expert,
++        const ps5lm::moe::PagingResult & result) {
++    std::fill(slot_data, slot_data + n_expert, -1);
++    for (const auto & assignment : result.assignments) {
++        if (assignment.key.expert < static_cast<uint32_t>(n_expert)) {
++            slot_data[assignment.key.expert] = static_cast<int32_t>(assignment.slot);
++        }
++    }
++}
++#endif
++
+ namespace {
+ 
++static const char * buft_slot_map_get_name(ggml_backend_buffer_type_t) {
++    return "SLOT_MAP_HOST";
++}
++
++static ggml_backend_buffer_type make_buft_slot_map() {
++    ggml_backend_buffer_type buft = *ggml_backend_cpu_buffer_type();
++    buft.iface.get_name = buft_slot_map_get_name;
++    return buft;
++}
++
++static ggml_backend_buffer_type_t get_buft_slot_map() {
++    static ggml_backend_buffer_type buft = make_buft_slot_map();
++    return &buft;
++}
++
+ // LRU of the experts of a group of layers, the slot of each expert is kept in the slot map of its layer
+ struct moe_cache_lru {
+     int32_t n_expert = 0;
+@@ -148,7 +186,81 @@ static bool llama_moe_cache_is_host_weight(const ggml_tensor * t) {
+         ggml_backend_buffer_is_host(t->buffer);
+ }
+ 
+-}
++#if !defined(_WIN32)
++class MoeCacheUploadBackend : public ps5lm::moe::ExpertUploadBackend {
++public:
++    ggml_backend_t backend = nullptr;
++    std::vector<ggml_tensor *> banks;
++    bool fault_injection_enabled = false;
++    int fault_injection_countdown = 0;
++    ps5lm::moe::UploadToken next_upload_token = 0;
++
++    ps5lm::moe::UploadSubmission submit_upload(
++            ps5lm::moe::ExpertKey key,
++            ps5lm::moe::ExpertTensorRole role,
++            std::size_t slot,
++            const void * source_bytes,
++            std::size_t byte_count) noexcept override {
++        GGML_UNUSED(key);
++        if (fault_injection_enabled) {
++            if (fault_injection_countdown <= 0) {
++                return { false, 0 };
++            }
++            fault_injection_countdown--;
++        }
++
++        size_t bank_idx = 0;
++        if (banks.size() == 3) {
++            switch (role) {
++                case ps5lm::moe::ExpertTensorRole::Gate: bank_idx = 0; break;
++                case ps5lm::moe::ExpertTensorRole::Up:   bank_idx = 1; break;
++                case ps5lm::moe::ExpertTensorRole::Down: bank_idx = 2; break;
++            }
++        } else if (banks.size() == 2) {
++            switch (role) {
++                case ps5lm::moe::ExpertTensorRole::Gate:
++                case ps5lm::moe::ExpertTensorRole::Up:   bank_idx = 0; break;
++                case ps5lm::moe::ExpertTensorRole::Down: bank_idx = 1; break;
++            }
++        }
++        if (bank_idx >= banks.size()) {
++            return { false, 0 };
++        }
++        ggml_tensor * bank = banks[bank_idx];
++        const size_t expert_stride = bank->nb[2];
++        const size_t offset = slot * expert_stride;
++
++        ggml_backend_tensor_set_async(backend, bank, source_bytes, offset, byte_count);
++
++        next_upload_token++;
++        return { true, next_upload_token };
++    }
++
++    ps5lm::moe::TransferFenceStatus wait_transfer(ps5lm::moe::UploadToken token) noexcept override {
++        GGML_UNUSED(token);
++        ggml_backend_synchronize(backend);
++        return ps5lm::moe::TransferFenceStatus::Complete;
++    }
++
++    void wait_transfers(const ps5lm::moe::UploadToken * tokens, std::size_t count,
++                        ps5lm::moe::TransferFenceStatus * statuses) noexcept override {
++        GGML_UNUSED(tokens);
++        if (count == 0) {
++            return;
++        }
++        // All uploads use this backend, so one synchronization covers the batch.
++        ggml_backend_synchronize(backend);
++        std::fill_n(statuses, count, ps5lm::moe::TransferFenceStatus::Complete);
++    }
++
++    ps5lm::moe::TransferFenceStatus quiesce() noexcept override {
++        ggml_backend_synchronize(backend);
++        return ps5lm::moe::TransferFenceStatus::Complete;
++    }
++};
++#endif
++
++} // namespace
+ 
+ struct llama_moe_cache::impl {
+     // a GPU with its own budget and banks, it caches the layers assigned to it
+@@ -173,6 +285,14 @@ struct llama_moe_cache::impl {
+         size_t host_bytes = 0;
+         int32_t n_slots = 0;
+         moe_cache_lru lru;
++
++#if !defined(_WIN32)
++        std::unique_ptr<MoeCacheUploadBackend> upload_backend;
++        std::unique_ptr<ps5lm::moe::SlotCache> slot_cache;
++        std::unique_ptr<ps5lm::moe::PagingQuarantine> quarantine;
++        std::unique_ptr<ps5lm::moe::PagingRuntime> runtime;
++        std::vector<ps5lm::moe::CompletionToken> pending_completion_tokens;
++#endif
+     };
+ 
+     struct layer {
+@@ -196,6 +316,9 @@ struct llama_moe_cache::impl {
+     static constexpr int64_t max_batch = 32;
+ 
+     int32_t n_expert_used;
++    bool is_paged_mode = false;
++    uint64_t next_completion_token = 0;
++    bool inject_invalid_expert = false;
+ 
+     stats stats_small; // up to 8 tokens per ubatch
+     stats stats_large;
+@@ -219,7 +342,7 @@ struct llama_moe_cache::impl {
+     ggml_context_ptr ctx_views;
+ 
+     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
+-            n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
++            n_expert_used(model.hparams.n_expert_used_max()), is_paged_mode(model.has_paged_experts), layers(model.layers.size()) {
+         for (size_t i = 0; i < backends.size(); ++i) {
+             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
+             if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+@@ -229,7 +352,13 @@ struct llama_moe_cache::impl {
+             }
+         }
+         if (devices.empty()) {
+-            throw std::runtime_error("MoE cache requires a GPU backend");
++            if (model.has_paged_experts && !backends.empty()) {
++                auto & d = devices.emplace_back();
++                d.backend = backends[0];
++                d.buft    = bufts[0];
++            } else {
++                throw std::runtime_error("MoE cache requires a GPU backend");
++            }
+         }
+         if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+             throw std::runtime_error("MoE cache does not support tensor parallelism");
+@@ -244,7 +373,10 @@ struct llama_moe_cache::impl {
+             if (experts.empty() || !std::all_of(experts.begin(), experts.end(), llama_moe_cache_is_host_weight)) {
+                 continue;
+             }
+-            const auto it_dev = std::find_if(devices.begin(), devices.end(), [&](const device & d) { return ggml_backend_get_device(d.backend) == model.dev_layer(il); });
++            const auto it_dev = std::find_if(devices.begin(), devices.end(), [&](const device & d) {
++                return ggml_backend_get_device(d.backend) == model.dev_layer(il) ||
++                       (model.has_paged_experts && model.devices.empty());
++            });
+             if (it_dev == devices.end()) {
+                 continue;
+             }
+@@ -307,6 +439,36 @@ struct llama_moe_cache::impl {
+             }
+         }
+ 
++        ggml_backend_buffer_type_t buft_host = is_paged_mode ? get_buft_slot_map() : ggml_backend_cpu_buffer_type();
++        const size_t alignment_host = ggml_backend_buft_get_alignment(buft_host);
++
++        if (is_paged_mode) {
++            size_t min_budget_floor = 0;
++            for (const group & g : groups) {
++                int32_t slots_min = 0;
++                for (int32_t il : g.layers) {
++                    slots_min = std::max<int32_t>(slots_min, std::min<int32_t>(model.hparams.n_expert_used(il), model.hparams.n_expert));
++                }
++                size_t staging_bytes = 0;
++                for (const ggml_tensor * t : g.ref) {
++                    staging_bytes = std::max<size_t>(staging_bytes, t->nb[2]);
++                }
++                if (staging_bytes > std::numeric_limits<size_t>::max() / ps5lm::moe::kHardMaxUploadBatchCapacity) {
++                    throw std::runtime_error("MoE staging budget overflows");
++                }
++                staging_bytes *= ps5lm::moe::kHardMaxUploadBatchCapacity;
++                size_t group_host_bytes = 0;
++                for (int32_t il : g.layers) {
++                    GGML_UNUSED(il);
++                    group_host_bytes += GGML_PAD(sizeof(int32_t) * g.ref[0]->ne[2], alignment_host);
++                }
++                min_budget_floor += alloc_size(g, slots_min) + staging_bytes + group_host_bytes;
++            }
++            if (size < min_budget_floor) {
++                throw std::runtime_error(format("MoE cache budget (%zu bytes) is below minimum budget floor (%zu bytes)", size, min_budget_floor));
++            }
++        }
++
+         // within a device the budget is split by the size of the experts, so each group caches the same fraction of its experts
+         std::vector<size_t> n_tensors(devices.size(), 0);
+         size_t n_tensors_host = 0;
+@@ -318,6 +480,9 @@ struct llama_moe_cache::impl {
+             while (g.n_slots < max_slots && alloc_size(g, g.n_slots + 1) <= budget) {
+                 g.n_slots++;
+             }
++            if (is_paged_mode && g.n_slots < n_expert_used) {
++                g.n_slots = n_expert_used;
++            }
+             if (g.n_slots < n_expert_used) {
+                 LLAMA_LOG_WARN("%s: MoE cache budget is too small for %zu layers, they are not cached\n", __func__, g.layers.size());
+                 g.n_slots = 0;
+@@ -351,9 +516,6 @@ struct llama_moe_cache::impl {
+         ctx_host  = init_ctx(n_tensors_host);
+         ctx_views = init_ctx(2);
+ 
+-        ggml_backend_buffer_type_t buft_host = ggml_backend_cpu_buffer_type();
+-        const size_t alignment_host = ggml_backend_buft_get_alignment(buft_host);
+-
+         for (size_t ig = 0; ig < groups.size(); ++ig) {
+             group & g = groups[ig];
+             if (g.n_slots == 0) {
+@@ -427,6 +589,83 @@ struct llama_moe_cache::impl {
+             }
+         }
+ 
++#if !defined(_WIN32)
++        if (is_paged_mode) {
++            for (group & g : groups) {
++                if (g.n_slots == 0) {
++                    continue;
++                }
++                g.upload_backend = std::make_unique<MoeCacheUploadBackend>();
++                g.upload_backend->backend = devices[g.id].backend;
++                g.upload_backend->banks   = g.banks;
++
++                size_t staging_capacity = 0;
++                size_t bytes_per_slot = 0;
++                for (const auto * t : g.ref) {
++                    staging_capacity = std::max<size_t>(staging_capacity, t->nb[2]);
++                    bytes_per_slot += t->nb[2];
++                }
++                g.quarantine = std::make_unique<ps5lm::moe::PagingQuarantine>(
++                    staging_capacity, ps5lm::moe::kHardMaxUploadBatchCapacity);
++
++                ps5lm::moe::SlotCacheOptions sc_opts;
++                sc_opts.slot_count = g.n_slots;
++                sc_opts.bytes_per_slot = bytes_per_slot;
++                sc_opts.byte_budget = alloc_size(g, g.n_slots);
++                sc_opts.max_in_flight_tokens = std::max<size_t>(64, g.layers.size() * 2);
++                sc_opts.max_request_keys = 4096;
++                g.slot_cache = std::make_unique<ps5lm::moe::SlotCache>(sc_opts);
++                if (g.slot_cache->configuration_status() != ps5lm::moe::SlotCacheStatus::Ok) {
++                    throw std::runtime_error("failed to initialize SlotCache");
++                }
++
++                std::vector<ps5lm::moe::LayerExpertTensorIds> layer_tensor_ids;
++                for (int32_t il : g.layers) {
++                    ps5lm::moe::LayerExpertTensorIds lids;
++                    lids.layer = static_cast<uint32_t>(il);
++                    const auto & layer = model.layers[il];
++                    if (layer.ffn_gate_exps) {
++                        model.paged_expert_tensor_id(layer.ffn_gate_exps, &lids.gate.tensor_id);
++                        lids.gate.bytes_per_expert = layer.ffn_gate_exps->nb[2];
++                    }
++                    if (layer.ffn_up_exps) {
++                        model.paged_expert_tensor_id(layer.ffn_up_exps, &lids.up.tensor_id);
++                        lids.up.bytes_per_expert = layer.ffn_up_exps->nb[2];
++                    }
++                    if (layer.ffn_down_exps) {
++                        model.paged_expert_tensor_id(layer.ffn_down_exps, &lids.down.tensor_id);
++                        lids.down.bytes_per_expert = layer.ffn_down_exps->nb[2];
++                    }
++                    if (layer.ffn_gate_up_exps) {
++                        uint64_t tid = 0;
++                        model.paged_expert_tensor_id(layer.ffn_gate_up_exps, &tid);
++                        lids.gate.tensor_id = tid;
++                        lids.gate.bytes_per_expert = layer.ffn_gate_up_exps->nb[2];
++                        lids.up.tensor_id = tid;
++                        lids.up.bytes_per_expert = layer.ffn_gate_up_exps->nb[2];
++                    }
++                    layer_tensor_ids.push_back(lids);
++                }
++
++                const auto * expert_source = model.paged_expert_source();
++                if (!expert_source) {
++                    throw std::runtime_error("paged MoE model missing ExpertSource");
++                }
++                g.runtime = std::make_unique<ps5lm::moe::PagingRuntime>(
++                    *g.slot_cache,
++                    *expert_source,
++                    *g.upload_backend,
++                    *g.quarantine,
++                    layer_tensor_ids,
++                    model.hparams.n_expert_used_max()
++                );
++                if (g.runtime->configuration_status() != ps5lm::moe::PagingStatus::Ok) {
++                    throw std::runtime_error("failed to initialize PagingRuntime");
++                }
++            }
++        }
++#endif
++
+         // as weights, the ops that read the banks run on the device and the slot maps are copied with the copy callback
+         for (device & d : devices) {
+             if (d.buf) {
+@@ -466,7 +705,8 @@ struct llama_moe_cache::impl {
+         const layer & l = layers[il];
+ 
+         // large batches use most experts of a layer, so they gain little from the cache and would evict the experts used in generation
+-        if (n_tokens == 0 || n_tokens > max_batch || std::min(n_tokens*n_expert_used, l.slot_map->ne[1]) > groups[l.ig].n_slots) {
++        const int64_t min_tokens = is_paged_mode ? 0 : 1;
++        if (n_tokens < min_tokens || n_tokens > max_batch || std::min(n_tokens*n_expert_used, l.slot_map->ne[1]) > groups[l.ig].n_slots) {
+             return nullptr;
+         }
+         return l.slot_map;
+@@ -582,6 +822,142 @@ struct llama_moe_cache::impl {
+         return true;
+     }
+ 
++    enum ggml_backend_sched_copy_result copy_v2(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
++        const auto it = layer_of.find(src);
++        if (it == layer_of.end()) {
++            return GGML_BACKEND_SCHED_COPY_NOT_HANDLED;
++        }
++
++        if (!is_paged_mode) {
++            bool ok = copy(backend, src, dst, graph);
++            return ok ? GGML_BACKEND_SCHED_COPY_HANDLED : GGML_BACKEND_SCHED_COPY_ERROR;
++        }
++
++#if !defined(_WIN32)
++        const int32_t il = it->second;
++        const layer & l = layers[il];
++        group & g = groups[l.ig];
++
++        if (backend != devices[g.id].backend || graph == nullptr || dst == nullptr || src == nullptr) {
++            LLAMA_LOG_ERROR("%s: invalid paging backend or graph for layer %d\n", __func__, il);
++            return GGML_BACKEND_SCHED_COPY_ERROR;
++        }
++
++        const int n_nodes = ggml_graph_n_nodes(graph);
++        const ggml_tensor * lookup = nullptr;
++        for (int i = 0; i < n_nodes && lookup == nullptr; ++i) {
++            const ggml_tensor * node = ggml_graph_node(graph, i);
++            if (node->op == GGML_OP_GET_ROWS && node->src[0] == dst) {
++                lookup = node;
++            }
++        }
++        if (lookup == nullptr || lookup->src[1] == nullptr) {
++            LLAMA_LOG_ERROR("%s: missing expert lookup for layer %d\n", __func__, il);
++            return GGML_BACKEND_SCHED_COPY_ERROR;
++        }
++
++        const ggml_tensor * sel = lookup->src[1];
++        for (int i = 0; i < n_nodes; ++i) {
++            const ggml_tensor * node = ggml_graph_node(graph, i);
++            if (node == sel || node == sel->view_src) {
++                LLAMA_LOG_ERROR("%s: experts for layer %d are selected in the same split as the cache lookup\n", __func__, il);
++                return GGML_BACKEND_SCHED_COPY_ERROR;
++            }
++        }
++        if (!ggml_is_contiguous(sel) || sel->type != GGML_TYPE_I32) {
++            LLAMA_LOG_ERROR("%s: invalid expert IDs for layer %d\n", __func__, il);
++            return GGML_BACKEND_SCHED_COPY_ERROR;
++        }
++
++        ids.resize(ggml_nelements(sel));
++        if (ids.empty()) {
++            ggml_backend_synchronize(backend);
++            for (auto token : g.pending_completion_tokens) {
++                g.slot_cache->complete(token);
++            }
++            g.pending_completion_tokens.clear();
++            ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
++            return GGML_BACKEND_SCHED_COPY_HANDLED;
++        }
++        ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
++        ggml_backend_synchronize(backend);
++
++        if (inject_invalid_expert && !ids.empty()) {
++            ids[0] = -1;
++        }
++
++        std::vector<uint32_t> requested;
++        requested.reserve(ids.size());
++        for (int32_t e : ids) {
++            if (e < 0 || e >= g.ref[0]->ne[2]) {
++                LLAMA_LOG_ERROR("%s: invalid expert %d for layer %d\n", __func__, e, il);
++                return GGML_BACKEND_SCHED_COPY_ERROR;
++            }
++            requested.push_back(static_cast<uint32_t>(e));
++        }
++
++        for (auto token : g.pending_completion_tokens) {
++            g.slot_cache->complete(token);
++        }
++        g.pending_completion_tokens.clear();
++
++        ps5lm::moe::CompletionToken use_token = ++next_completion_token;
++        g.pending_completion_tokens.push_back(use_token);
++
++        auto res = g.runtime->load_layer(static_cast<uint32_t>(il), requested, use_token);
++        if (!res.ok()) {
++            LLAMA_LOG_ERROR("%s: layer %d paging failed: %s\n", __func__, il, ps5lm::moe::paging_status_name(res.status));
++            return GGML_BACKEND_SCHED_COPY_ERROR;
++        }
++
++        // Only IDs selected by this layer's GET_ROWS are looked up from the
++        // slot map. Rebuild it from the deduplicated current assignments.
++        int32_t * slot_data = (int32_t *) l.slot_map->data;
++        const int32_t n_expert = g.ref[0]->ne[2];
++        llama_moe_cache_detail::rebuild_slot_map(slot_data, n_expert, res);
++
++        ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
++        return GGML_BACKEND_SCHED_COPY_HANDLED;
++#else
++        return GGML_BACKEND_SCHED_COPY_ERROR;
++#endif
++    }
++
++    void complete_pending_paging() {
++#if !defined(_WIN32)
++        if (!is_paged_mode) {
++            return;
++        }
++        for (group & g : groups) {
++            if (g.slot_cache) {
++                for (auto token : g.pending_completion_tokens) {
++                    g.slot_cache->complete(token);
++                }
++                g.pending_completion_tokens.clear();
++            }
++        }
++#endif
++    }
++
++    void set_fault_injection(bool enable, int countdown) {
++#if !defined(_WIN32)
++        inject_invalid_expert = enable && countdown == -2;
++        for (group & g : groups) {
++            if (g.upload_backend) {
++                g.upload_backend->fault_injection_enabled = enable && countdown != -2;
++                g.upload_backend->fault_injection_countdown = countdown;
++            }
++        }
++#else
++        GGML_UNUSED(enable);
++        GGML_UNUSED(countdown);
++#endif
++    }
++
++    ggml_backend_buffer_type_t buft_slot_map() const {
++        return get_buft_slot_map();
++    }
++
+     void log_stats() const {
+         auto log = [](const char * name, const stats & st) {
+             const size_t n = st.hits + st.misses;
+@@ -621,6 +997,22 @@ bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml
+     return pimpl->copy(backend, src, dst, graph);
+ }
+ 
++enum ggml_backend_sched_copy_result llama_moe_cache::copy_v2(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
++    return pimpl->copy_v2(backend, src, dst, graph);
++}
++
++void llama_moe_cache::complete_pending_paging() {
++    pimpl->complete_pending_paging();
++}
++
++ggml_backend_buffer_type_t llama_moe_cache::buft_slot_map() const {
++    return pimpl->buft_slot_map();
++}
++
++void llama_moe_cache::set_fault_injection(bool enable, int countdown) {
++    pimpl->set_fault_injection(enable, countdown);
++}
++
+ int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
+     return pimpl->copy_experts(backend, w, dst, e, last);
+ }
+diff --git a/src/llama-moe-cache.h b/src/llama-moe-cache.h
+index 3b6726b..eea8544 100644
+--- a/src/llama-moe-cache.h
++++ b/src/llama-moe-cache.h
+@@ -8,6 +8,18 @@
+ 
+ struct llama_model;
+ 
++#if !defined(_WIN32)
++namespace ps5lm::moe {
++struct PagingResult;
++}
++
++namespace llama_moe_cache_detail {
++// Rebuild the host slot map from the assignments required by this layer's
++// current lookup. Unselected experts remain uncached in this map.
++void rebuild_slot_map(int32_t * slot_data, int32_t n_expert, const ps5lm::moe::PagingResult & result);
++}
++#endif
++
+ // keeps the most recently used experts of host-resident MoE layers in a device buffer
+ // each layer has a slot map in host memory: when the scheduler copies it to the device, the copy callback uploads the missing experts
+ class llama_moe_cache {
+@@ -28,6 +40,18 @@ public:
+     // ggml_backend_sched copy callback, returns false if src is not a slot map
+     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
+ 
++    // v2 copy callback returning tri-state sched copy result
++    enum ggml_backend_sched_copy_result copy_v2(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
++
++    // complete any in-flight completion tokens in the slot cache
++    void complete_pending_paging();
++
++    // buffer type used for slot maps in host memory
++    ggml_backend_buffer_type_t buft_slot_map() const;
++
++    // fault injection for tests
++    void set_fault_injection(bool enable, int countdown = 0);
++
+     // for large batches: copy the experts of w that are in the cache, starting at expert e and up to expert last, to the copy dst of w
+     // returns the number of experts copied, 0 if expert e is not in the cache
+     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last);
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 1a9bc91..127f4b5 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -316,7 +316,16 @@ endif()
+ llama_build(test-backend-ops.cpp LINK ggml)
+ 
+ llama_build_and_test(test-tiled-mulmat.cpp LINK ggml)
++llama_build_and_test(test-backend-sched-copy-callback.cpp LINK ggml)
+ llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
++if (NOT WIN32)
++    llama_build_and_test(test-moe-paged-loader.cpp LABEL "model" LINK llama)
++    llama_build_and_test(test-moe-paging-inference.cpp LABEL "model" LINK llama)
++    llama_build_and_test(test-moe-cache-slot-map.cpp LABEL "model" LINK llama)
++    target_include_directories(test-moe-paged-loader PRIVATE "${PS5LM_MOE_SOURCE_DIR}")
++    target_include_directories(test-moe-paging-inference PRIVATE "${PS5LM_MOE_SOURCE_DIR}")
++    target_include_directories(test-moe-cache-slot-map PRIVATE "${PS5LM_MOE_SOURCE_DIR}")
++endif()
+ llama_build_and_test(test-autorelease.cpp       LABEL "model")
+ llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
+ 
+diff --git a/tests/test-moe-cache-slot-map.cpp b/tests/test-moe-cache-slot-map.cpp
+new file mode 100644
+index 0000000..4372929
+--- /dev/null
++++ b/tests/test-moe-cache-slot-map.cpp
+@@ -0,0 +1,110 @@
++#include "../src/llama-moe-cache.h"
++
++#include "paging_runtime.hpp"
++#include "slot_cache.hpp"
++
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++using namespace ps5lm::moe;
++
++static void require(bool condition, const char * message) {
++    if (!condition) {
++        throw std::runtime_error(message);
++    }
++}
++
++static PagingResult reserve_and_commit(
++        SlotCache & cache,
++        uint32_t layer,
++        const std::vector<uint32_t> & experts,
++        CompletionToken token) {
++    std::vector<ExpertKey> requested;
++    requested.reserve(experts.size());
++    for (uint32_t expert : experts) {
++        requested.push_back({layer, expert});
++    }
++
++    ReserveResult reserved = cache.reserve(requested);
++    require(reserved.ok(), "slot cache reservation failed");
++    for (const SlotAssignment & assignment : reserved.reservation.assignments()) {
++        if (assignment.needs_upload) {
++            require(reserved.reservation.mark_upload_complete(assignment.key) == SlotCacheStatus::Ok,
++                    "marking synthetic upload complete failed");
++        }
++    }
++
++    PagingResult result;
++    result.status = PagingStatus::Ok;
++    result.assignments = reserved.reservation.assignments();
++    require(reserved.reservation.commit(token) == SlotCacheStatus::Ok, "slot cache commit failed");
++    return result;
++}
++
++static void check_selected_mapping(
++        const SlotCache & cache,
++        uint32_t layer,
++        const std::vector<uint32_t> & selected,
++        const std::vector<int32_t> & slot_map) {
++    for (uint32_t expert : selected) {
++        std::size_t resident_slot = kNoSlot;
++        require(cache.find_slot({layer, expert}, &resident_slot), "selected expert is not resident");
++        require(slot_map[expert] == static_cast<int32_t>(resident_slot),
++                "selected-ID mapping differs from resident cache mapping");
++    }
++}
++
++int main() {
++    try {
++        constexpr uint32_t layer = 5;
++        constexpr int32_t expert_count = 4;
++        SlotCacheOptions options;
++        options.slot_count = 2;
++        options.bytes_per_slot = 1;
++        options.byte_budget = 2;
++        options.max_in_flight_tokens = 8;
++        options.max_request_keys = 8;
++        SlotCache cache(options);
++        require(cache.configuration_status() == SlotCacheStatus::Ok, "slot cache configuration failed");
++        std::vector<int32_t> slot_map(expert_count, -1);
++
++        // First access includes a duplicate ID and two misses.
++        const std::vector<uint32_t> first_selected{0, 1, 0};
++        PagingResult first = reserve_and_commit(cache, layer, first_selected, 1);
++        require(first.assignments.size() == 2, "duplicate expert consumed an extra assignment");
++        llama_moe_cache_detail::rebuild_slot_map(slot_map.data(), expert_count, first);
++        check_selected_mapping(cache, layer, first_selected, slot_map);
++        require(slot_map[2] == -1 && slot_map[3] == -1, "unselected experts must stay unmapped");
++        require(cache.complete(1) == SlotCacheStatus::Ok, "completing first cache use failed");
++
++        // Expert 1 is a hit; 2 is a miss that evicts 0. The new map must keep
++        // the hit's slot and clear the evicted expert's stale mapping.
++        const std::vector<uint32_t> second_selected{1, 2, 1};
++        PagingResult second = reserve_and_commit(cache, layer, second_selected, 2);
++        require(second.assignments.size() == 2, "hit plus miss assignment count is wrong");
++        llama_moe_cache_detail::rebuild_slot_map(slot_map.data(), expert_count, second);
++        check_selected_mapping(cache, layer, second_selected, slot_map);
++        require(slot_map[0] == -1, "evicted expert retained a stale slot-map entry");
++        require(cache.complete(2) == SlotCacheStatus::Ok, "completing second cache use failed");
++
++        // A repeated lookup of the same layer exercises another hit, another
++        // eviction, and duplicate selected IDs after the map was reused.
++        const std::vector<uint32_t> third_selected{2, 3, 2};
++        PagingResult third = reserve_and_commit(cache, layer, third_selected, 3);
++        require(third.assignments.size() == 2, "second hit plus miss assignment count is wrong");
++        llama_moe_cache_detail::rebuild_slot_map(slot_map.data(), expert_count, third);
++        check_selected_mapping(cache, layer, third_selected, slot_map);
++        require(slot_map[1] == -1, "second evicted expert retained a stale slot-map entry");
++        require(cache.complete(3) == SlotCacheStatus::Ok, "completing third cache use failed");
++    } catch (const std::exception & e) {
++        std::fprintf(stderr, "test-moe-cache-slot-map: %s\n", e.what());
++        return 1;
++    }
++
++    std::fprintf(stderr, "test-moe-cache-slot-map: passed\n");
++    return 0;
++}
+diff --git a/tests/test-moe-paging-inference.cpp b/tests/test-moe-paging-inference.cpp
+new file mode 100644
+index 0000000..d8173a1
+--- /dev/null
++++ b/tests/test-moe-paging-inference.cpp
+@@ -0,0 +1,512 @@
++// Integration test for Qwen3MoE Non-Resident Expert Paging & Inference Parity.
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#include "llama.h"
++#include "../src/llama-model.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <initializer_list>
++#include <limits>
++#include <stdexcept>
++#include <string>
++#include <unistd.h>
++#include <vector>
++
++static void llama_batch_clear(struct llama_batch & batch) {
++    batch.n_tokens = 0;
++}
++
++static void llama_batch_add(
++        struct llama_batch & batch,
++        llama_token id,
++        llama_pos pos,
++        std::initializer_list<llama_seq_id> seq_ids,
++        bool logits) {
++    const int32_t idx = batch.n_tokens;
++    batch.token   [idx] = id;
++    batch.pos     [idx] = pos;
++    batch.n_seq_id[idx] = seq_ids.size();
++    size_t i = 0;
++    for (llama_seq_id sid : seq_ids) {
++        batch.seq_id[idx][i++] = sid;
++    }
++    batch.logits  [idx] = logits;
++    batch.n_tokens++;
++}
++
++static void require(bool condition, const char * message) {
++    if (!condition) {
++        throw std::runtime_error(message);
++    }
++}
++
++static std::string find_fixture_path(const std::string & rel_path) {
++    const char * env_path = std::getenv("PS5LM_FIXTURE_PATH");
++    if (env_path && access(env_path, R_OK) == 0) {
++        return env_path;
++    }
++    const std::vector<std::string> prefixes = {
++        "",
++        "./",
++        "../",
++        "../../",
++        "../../../",
++        "../../../../",
++    };
++    for (const auto & p : prefixes) {
++        std::string cand = p + rel_path;
++        if (access(cand.c_str(), R_OK) == 0) {
++            return cand;
++        }
++    }
++    return "";
++}
++
++static void assert_logits_parity(const std::vector<float> & a, const std::vector<float> & b, float tol = 1e-5f) {
++    require(a.size() == b.size(), "logits dimension mismatch");
++    float max_diff = 0.0f;
++    for (size_t i = 0; i < a.size(); ++i) {
++        float diff = std::fabs(a[i] - b[i]);
++        if (diff > max_diff) {
++            max_diff = diff;
++        }
++    }
++    if (max_diff >= tol) {
++        char buf[256];
++        std::snprintf(buf, sizeof(buf), "logits parity violated: max diff %g >= %g", max_diff, tol);
++        throw std::runtime_error(buf);
++    }
++}
++
++static std::vector<float> run_eval_sequence(
++        llama_model * model,
++        llama_context_params cparams,
++        const std::vector<llama_token> & tokens,
++        int n_decode_steps = 0) {
++    llama_context * ctx = llama_init_from_model(model, cparams);
++    require(ctx != nullptr, "failed to create context for eval");
++
++    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
++    std::vector<float> result_logits;
++
++    // Prefill tokens
++    llama_batch batch = llama_batch_init(tokens.size() + n_decode_steps, 0, 1);
++    for (size_t i = 0; i < tokens.size(); ++i) {
++        llama_batch_add(batch, tokens[i], i, { 0 }, i == tokens.size() - 1);
++    }
++    int ret = llama_decode(ctx, batch);
++    require(ret == 0, "prefill llama_decode failed");
++
++    float * logits = llama_get_logits_ith(ctx, -1);
++    require(logits != nullptr, "null logits after prefill");
++    result_logits.assign(logits, logits + n_vocab);
++
++    // Subsequent single-token decode steps
++    for (int step = 0; step < n_decode_steps; ++step) {
++        llama_token next_token = 0;
++        float max_logit = -std::numeric_limits<float>::infinity();
++        for (int v = 0; v < n_vocab; ++v) {
++            if (logits[v] > max_logit) {
++                max_logit = logits[v];
++                next_token = v;
++            }
++        }
++
++        llama_batch_clear(batch);
++        llama_batch_add(batch, next_token, tokens.size() + step, { 0 }, true);
++
++        ret = llama_decode(ctx, batch);
++        require(ret == 0, "decode step failed");
++
++        logits = llama_get_logits_ith(ctx, -1);
++        require(logits != nullptr, "null logits in decode step");
++        result_logits.insert(result_logits.end(), logits, logits + n_vocab);
++    }
++
++    llama_batch_free(batch);
++    llama_free(ctx);
++    return result_logits;
++}
++
++static void test_context_validation_and_budget_floor(const std::string & fixture_path) {
++    auto mparams = llama_model_default_params();
++    mparams.use_moe_expert_paging = true;
++    mparams.use_extra_bufts = false;
++    llama_model * model = llama_model_load_from_file(fixture_path.c_str(), mparams);
++    require(model != nullptr, "paged model load failed");
++    require(model->has_paged_experts, "has_paged_experts must be true");
++
++    // 1. n_ubatch > 1 must fail closed
++    {
++        auto cparams = llama_context_default_params();
++        cparams.n_ubatch = 2;
++        cparams.n_seq_max = 1;
++        cparams.moe_cache_size = 64 * 1024 * 1024;
++        llama_context * ctx = llama_init_from_model(model, cparams);
++        if (ctx) { llama_free(ctx); }
++        require(ctx == nullptr, "must fail closed when n_ubatch > 1");
++    }
++
++    // 2. n_seq_max > 1 must fail closed
++    {
++        auto cparams = llama_context_default_params();
++        cparams.n_ubatch = 1;
++        cparams.n_seq_max = 2;
++        cparams.moe_cache_size = 64 * 1024 * 1024;
++        llama_context * ctx = llama_init_from_model(model, cparams);
++        if (ctx) { llama_free(ctx); }
++        require(ctx == nullptr, "must fail closed when n_seq_max > 1");
++    }
++
++    // 3. moe_cache_size == 0 must fail closed
++    {
++        auto cparams = llama_context_default_params();
++        cparams.n_ubatch = 1;
++        cparams.n_seq_max = 1;
++        cparams.moe_cache_size = 0;
++        llama_context * ctx = llama_init_from_model(model, cparams);
++        if (ctx) { llama_free(ctx); }
++        require(ctx == nullptr, "must fail closed when moe_cache_size == 0");
++    }
++
++    // 4. embeddings == true must fail closed
++    {
++        auto cparams = llama_context_default_params();
++        cparams.n_ubatch = 1;
++        cparams.n_seq_max = 1;
++        cparams.moe_cache_size = 64 * 1024 * 1024;
++        cparams.embeddings = true;
++        llama_context * ctx = llama_init_from_model(model, cparams);
++        if (ctx) { llama_free(ctx); }
++        require(ctx == nullptr, "must fail closed when embeddings == true");
++    }
++
++    // 5. causal_attn == false must fail closed
++    {
++        auto cparams = llama_context_default_params();
++        cparams.n_ubatch = 1;
++        cparams.n_seq_max = 1;
++        cparams.moe_cache_size = 64 * 1024 * 1024;
++        cparams.attention_type = LLAMA_ATTENTION_TYPE_NON_CAUSAL;
++        llama_context * ctx = llama_init_from_model(model, cparams);
++        if (ctx) { llama_free(ctx); }
++        require(ctx == nullptr, "must fail closed when causal_attn == false");
++    }
++
++    // 6. moe_cache_size < budget_floor must fail closed
++    {
++        auto cparams = llama_context_default_params();
++        cparams.n_ubatch = 1;
++        cparams.n_seq_max = 1;
++        cparams.moe_cache_size = 512; // Far below minimum budget floor
++        llama_context * ctx = llama_init_from_model(model, cparams);
++        if (ctx) { llama_free(ctx); }
++        require(ctx == nullptr, "must fail closed when moe_cache_size < budget_floor");
++    }
++
++    // 7. Valid parameters must succeed
++    {
++        auto cparams = llama_context_default_params();
++        cparams.n_ubatch = 1;
++        cparams.n_seq_max = 1;
++        cparams.moe_cache_size = 64 * 1024 * 1024;
++        llama_context * ctx = llama_init_from_model(model, cparams);
++        require(ctx != nullptr, "valid paged context initialization failed");
++        llama_free(ctx);
++    }
++
++    llama_model_free(model);
++}
++
++static void test_prefill_and_decode_parity(const std::string & fixture_path) {
++    auto mparams_res = llama_model_default_params();
++    mparams_res.use_moe_expert_paging = false;
++    mparams_res.use_extra_bufts = false;
++    llama_model * model_res = llama_model_load_from_file(fixture_path.c_str(), mparams_res);
++    require(model_res != nullptr, "resident model load failed");
++
++    auto mparams_paged = llama_model_default_params();
++    mparams_paged.use_moe_expert_paging = true;
++    mparams_paged.use_extra_bufts = false;
++    llama_model * model_paged = llama_model_load_from_file(fixture_path.c_str(), mparams_paged);
++    require(model_paged != nullptr, "paged model load failed");
++
++    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_res));
++    require(n_vocab > 0, "n_vocab must be positive");
++
++    const std::vector<int> prompt_lengths = { 1, 2, 5, 33 };
++
++    for (int len : prompt_lengths) {
++        std::vector<llama_token> tokens(len);
++        for (int i = 0; i < len; ++i) {
++            tokens[i] = static_cast<llama_token>((i * 7 + 3) % (n_vocab > 10 ? 10 : n_vocab) + 1);
++        }
++
++        // Resident run (normal ubatch)
++        auto cparams_res = llama_context_default_params();
++        cparams_res.n_ctx = len + 16;
++        cparams_res.n_batch = len + 16;
++        cparams_res.n_ubatch = len + 16;
++        cparams_res.n_seq_max = 1;
++        auto logits_res = run_eval_sequence(model_res, cparams_res, tokens, 4);
++
++        // Resident run (1-token ubatch for exact parity check)
++        auto cparams_res_u1 = cparams_res;
++        cparams_res_u1.n_ubatch = 1;
++        auto logits_res_u1 = run_eval_sequence(model_res, cparams_res_u1, tokens, 4);
++
++        // Paged run (n_ubatch=1 bounded)
++        auto cparams_paged = llama_context_default_params();
++        cparams_paged.n_ctx = len + 16;
++        cparams_paged.n_batch = len + 16;
++        cparams_paged.n_ubatch = 1;
++        cparams_paged.n_seq_max = 1;
++        cparams_paged.moe_cache_size = 64 * 1024 * 1024;
++        auto logits_paged = run_eval_sequence(model_paged, cparams_paged, tokens, 4);
++
++        assert_logits_parity(logits_res_u1, logits_paged, 1e-6f);
++        assert_logits_parity(logits_res, logits_paged, 1e-5f);
++    }
++
++    llama_model_free(model_res);
++    llama_model_free(model_paged);
++}
++
++static void test_warmup_and_eviction_parity(const std::string & fixture_path) {
++    auto mparams_res = llama_model_default_params();
++    mparams_res.use_moe_expert_paging = false;
++    mparams_res.use_extra_bufts = false;
++    llama_model * model_res = llama_model_load_from_file(fixture_path.c_str(), mparams_res);
++    require(model_res != nullptr, "resident model load failed");
++
++    auto mparams_paged = llama_model_default_params();
++    mparams_paged.use_moe_expert_paging = true;
++    mparams_paged.use_extra_bufts = false;
++    llama_model * model_paged = llama_model_load_from_file(fixture_path.c_str(), mparams_paged);
++    require(model_paged != nullptr, "paged model load failed");
++
++    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_res));
++    const int total_tokens = 25;
++
++    std::vector<llama_token> tokens(3);
++    for (size_t i = 0; i < tokens.size(); ++i) {
++        tokens[i] = static_cast<llama_token>((i + 1) % n_vocab);
++    }
++
++    // Resident baseline for 3 prompt tokens + 22 decode steps
++    auto cparams_res = llama_context_default_params();
++    cparams_res.n_ctx = total_tokens + 8;
++    cparams_res.n_batch = total_tokens + 8;
++    cparams_res.n_ubatch = total_tokens + 8;
++    cparams_res.n_seq_max = 1;
++    auto logits_res = run_eval_sequence(model_res, cparams_res, tokens, 22);
++
++    // Paged run with warmup and forced repeated evictions
++    auto cparams_paged = llama_context_default_params();
++    cparams_paged.n_ctx = total_tokens + 8;
++    cparams_paged.n_batch = total_tokens + 8;
++    cparams_paged.n_ubatch = 1;
++    cparams_paged.n_seq_max = 1;
++    cparams_paged.moe_cache_size = 4 * 1024 * 1024; // smaller budget forcing repeated eviction
++
++    llama_context * ctx_paged = llama_init_from_model(model_paged, cparams_paged);
++    require(ctx_paged != nullptr, "failed to create paged context");
++
++    // Exercise warmup transition
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
++    llama_set_warmup(ctx_paged, true);
++    llama_set_warmup(ctx_paged, false);
++#pragma GCC diagnostic pop
++
++    llama_batch batch = llama_batch_init(total_tokens + 8, 0, 1);
++    for (size_t i = 0; i < tokens.size(); ++i) {
++        llama_batch_add(batch, tokens[i], i, { 0 }, i == tokens.size() - 1);
++    }
++    int ret = llama_decode(ctx_paged, batch);
++    require(ret == 0, "paged prefill failed");
++
++    std::vector<float> logits_paged;
++    float * cur_logits = llama_get_logits_ith(ctx_paged, -1);
++    require(cur_logits != nullptr, "null logits");
++    logits_paged.assign(cur_logits, cur_logits + n_vocab);
++
++    for (int step = 0; step < 22; ++step) {
++        llama_token next_token = 0;
++        float max_logit = -std::numeric_limits<float>::infinity();
++        for (int v = 0; v < n_vocab; ++v) {
++            if (cur_logits[v] > max_logit) {
++                max_logit = cur_logits[v];
++                next_token = v;
++            }
++        }
++
++        llama_batch_clear(batch);
++        llama_batch_add(batch, next_token, tokens.size() + step, { 0 }, true);
++
++        ret = llama_decode(ctx_paged, batch);
++        require(ret == 0, "paged decode step failed");
++
++        cur_logits = llama_get_logits_ith(ctx_paged, -1);
++        require(cur_logits != nullptr, "null logits in decode step");
++        logits_paged.insert(logits_paged.end(), cur_logits, cur_logits + n_vocab);
++    }
++
++    llama_batch_free(batch);
++    llama_free(ctx_paged);
++
++    assert_logits_parity(logits_res, logits_paged, 1e-5f);
++
++    llama_model_free(model_res);
++    llama_model_free(model_paged);
++}
++
++static void test_fault_injection_and_recovery(const std::string & fixture_path) {
++    auto mparams_res = llama_model_default_params();
++    mparams_res.use_moe_expert_paging = false;
++    mparams_res.use_extra_bufts = false;
++    llama_model * model_res = llama_model_load_from_file(fixture_path.c_str(), mparams_res);
++    require(model_res != nullptr, "resident model load failed");
++
++    auto mparams_paged = llama_model_default_params();
++    mparams_paged.use_moe_expert_paging = true;
++    mparams_paged.use_extra_bufts = false;
++    llama_model * model_paged = llama_model_load_from_file(fixture_path.c_str(), mparams_paged);
++    require(model_paged != nullptr, "paged model load failed");
++
++    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_res));
++
++    const std::vector<llama_token> tokens = { 1, 2 };
++
++    // Baseline logits on resident model
++    auto cparams_res = llama_context_default_params();
++    cparams_res.n_ctx = 32;
++    cparams_res.n_batch = 32;
++    cparams_res.n_ubatch = 32;
++    cparams_res.n_seq_max = 1;
++    auto logits_baseline = run_eval_sequence(model_res, cparams_res, tokens, 1);
++
++    // Paged context
++    auto cparams_paged = llama_context_default_params();
++    cparams_paged.n_ctx = 32;
++    cparams_paged.n_batch = 32;
++    cparams_paged.n_ubatch = 1;
++    cparams_paged.n_seq_max = 1;
++    cparams_paged.moe_cache_size = 32 * 1024 * 1024;
++    llama_context * ctx_paged = llama_init_from_model(model_paged, cparams_paged);
++    require(ctx_paged != nullptr, "paged context init failed");
++
++    // 1. Initial prefill succeeds
++    llama_batch batch = llama_batch_init(32, 0, 1);
++    for (size_t i = 0; i < tokens.size(); ++i) {
++        llama_batch_add(batch, tokens[i], i, { 0 }, i == tokens.size() - 1);
++    }
++    int ret = llama_decode(ctx_paged, batch);
++    require(ret == 0, "initial prefill failed");
++
++    // A malformed router ID must fail the request, not terminate the process.
++    llama_moe_set_fault_injection(ctx_paged, true, -2);
++    llama_batch_clear(batch);
++    llama_batch_add(batch, 3, tokens.size(), { 0 }, true);
++    ret = llama_decode(ctx_paged, batch);
++    require(ret == -3, "invalid router ID must return a graph error");
++    llama_moe_set_fault_injection(ctx_paged, false, 0);
++    llama_memory_clear(llama_get_memory(ctx_paged), true);
++    llama_batch_clear(batch);
++    for (size_t i = 0; i < tokens.size(); ++i) {
++        llama_batch_add(batch, tokens[i], i, { 0 }, i == tokens.size() - 1);
++    }
++    ret = llama_decode(ctx_paged, batch);
++    require(ret == 0, "prefill after invalid router ID failed");
++
++    // 2. Inject fault on next upload
++    llama_moe_set_fault_injection(ctx_paged, true, 0);
++
++    llama_batch_clear(batch);
++    llama_batch_add(batch, 3, tokens.size(), { 0 }, true);
++
++    ret = llama_decode(ctx_paged, batch);
++    // Must fail closed with error code -3 (GGML_STATUS_FAILED)
++    require(ret != 0, "decode must fail closed under fault injection");
++    require(ret == -3, "decode error return code must be -3");
++
++    // 3. Clear fault injection and recover
++    llama_moe_set_fault_injection(ctx_paged, false, 0);
++
++    // Clear KV cache and context state
++    llama_memory_clear(llama_get_memory(ctx_paged), true);
++
++    // 4. Retry sequence from scratch - must succeed and match baseline
++    llama_batch_clear(batch);
++    for (size_t i = 0; i < tokens.size(); ++i) {
++        llama_batch_add(batch, tokens[i], i, { 0 }, i == tokens.size() - 1);
++    }
++    ret = llama_decode(ctx_paged, batch);
++    require(ret == 0, "recovery prefill failed");
++
++    float * logits = llama_get_logits_ith(ctx_paged, -1);
++    require(logits != nullptr, "null logits on recovery prefill");
++    std::vector<float> recovered_logits(logits, logits + n_vocab);
++
++    llama_token next_token = 0;
++    float max_logit = -std::numeric_limits<float>::infinity();
++    for (int v = 0; v < n_vocab; ++v) {
++        if (logits[v] > max_logit) {
++            max_logit = logits[v];
++            next_token = v;
++        }
++    }
++
++    llama_batch_clear(batch);
++    llama_batch_add(batch, next_token, tokens.size(), { 0 }, true);
++    ret = llama_decode(ctx_paged, batch);
++    require(ret == 0, "recovery decode step failed");
++
++    logits = llama_get_logits_ith(ctx_paged, -1);
++    require(logits != nullptr, "null logits on recovery decode");
++    recovered_logits.insert(recovered_logits.end(), logits, logits + n_vocab);
++
++    assert_logits_parity(logits_baseline, recovered_logits, 1e-5f);
++
++    llama_batch_free(batch);
++    llama_free(ctx_paged);
++    llama_model_free(model_res);
++    llama_model_free(model_paged);
++}
++
++int main() {
++    try {
++        llama_backend_init();
++
++        const std::string fixture_path = find_fixture_path("tests/fixtures/moe_paging/qwen3moe-tiny-f32.gguf");
++        if (fixture_path.empty()) {
++            std::fprintf(stderr, "warning: qwen3moe-tiny-f32.gguf fixture not found, skipping inference tests\n");
++            llama_backend_free();
++            return 0;
++        }
++
++        std::fprintf(stderr, "Running test_context_validation_and_budget_floor...\n");
++        test_context_validation_and_budget_floor(fixture_path);
++
++        std::fprintf(stderr, "Running test_prefill_and_decode_parity...\n");
++        test_prefill_and_decode_parity(fixture_path);
++
++        std::fprintf(stderr, "Running test_warmup_and_eviction_parity...\n");
++        test_warmup_and_eviction_parity(fixture_path);
++
++        std::fprintf(stderr, "Running test_fault_injection_and_recovery...\n");
++        test_fault_injection_and_recovery(fixture_path);
++
++        llama_backend_free();
++    } catch (const std::exception & e) {
++        std::fprintf(stderr, "test-moe-paging-inference: FAILED: %s\n", e.what());
++        llama_backend_free();
++        return 1;
++    }
++    std::fprintf(stderr, "test-moe-paging-inference: all tests passed\n");
++    return 0;
++}

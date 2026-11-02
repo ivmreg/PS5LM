@@ -1,0 +1,352 @@
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index 7a65d81..11029ce 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -326,6 +326,16 @@ extern "C" {
+     // `graph` is the compute graph of the split
+     typedef bool (*ggml_backend_sched_copy_callback)(ggml_backend_t backend, const struct ggml_tensor * src, struct ggml_tensor * dst, struct ggml_cgraph * graph, void * user_data);
+ 
++    enum ggml_backend_sched_copy_result {
++        GGML_BACKEND_SCHED_COPY_NOT_HANDLED = 0,
++        GGML_BACKEND_SCHED_COPY_HANDLED = 1,
++        GGML_BACKEND_SCHED_COPY_ERROR = 2,
++    };
++
++    // The v2 callback takes precedence over the legacy callback when set.
++    // NOT_HANDLED falls back to a full tensor copy; ERROR fails graph compute.
++    typedef enum ggml_backend_sched_copy_result (*ggml_backend_sched_copy_callback_v2)(ggml_backend_t backend, const struct ggml_tensor * src, struct ggml_tensor * dst, struct ggml_cgraph * graph, void * user_data);
++
+     // Callback when the buffers reserved for a graph are not sufficient and have to be reserved again
+     // it happens on the graph allocation path and costs a synchronization of the backends
+     // `sched` is the scheduler
+@@ -374,6 +384,7 @@ extern "C" {
+ 
+     // Set a callback to be called when the inputs weights of a split are being copied
+     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
++    GGML_API void                 ggml_backend_sched_set_copy_callback_v2(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback_v2 callback, void * user_data);
+ 
+     // Set a callback to be called when the compute buffers of a graph are being reallocated
+     GGML_API void                 ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data);
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index ffbcba3..f1b9c41 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -969,6 +969,9 @@ struct ggml_backend_sched {
+     ggml_backend_sched_copy_callback callback_copy;
+     void * callback_copy_user_data;
+ 
++    ggml_backend_sched_copy_callback_v2 callback_copy_v2;
++    void * callback_copy_v2_user_data;
++
+     ggml_backend_sched_realloc_callback callback_realloc;
+     void * callback_realloc_user_data;
+ 
+@@ -1471,7 +1474,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+ 
+             // check if we should start a new split based on the sources of the current node
+             bool need_new_split = false;
+-            if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
++            if (node_backend_id == cur_backend_id && (split->n_inputs > 0 || (node->op == GGML_OP_GET_ROWS && i > split->i_start))) {
+                 for (int j = 0; j < GGML_MAX_SRC; j++) {
+                     struct ggml_tensor * src = node->src[j];
+                     if (src == NULL) {
+@@ -1820,23 +1823,21 @@ static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t) {
+         ggml_backend_buffer_is_host(t->buffer);
+ }
+ 
+-static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input) {
++static enum ggml_status ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input) {
+     const int split_backend_id = split->backend_id;
+     ggml_backend_t split_backend = sched->backends[split_backend_id];
+     ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
+     struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+ 
+     if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+-        // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+         } else {
+             ggml_backend_synchronize(split_backend);
+         }
+         ggml_backend_tensor_copy(input, input_cpy);
+-        return;
++        return GGML_STATUS_SUCCESS;
+     }
+-
+     // wait for the split backend to finish using the input before overwriting it
+     if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+         ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+@@ -1844,11 +1845,21 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+         ggml_backend_synchronize(split_backend);
+     }
+ 
+-    if (sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input) &&
+-        sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
+-        return;
++    if (ggml_backend_sched_is_host_weight(input)) {
++        if (sched->callback_copy_v2 != NULL) {
++            switch (sched->callback_copy_v2(split_backend, input, input_cpy, &split->graph, sched->callback_copy_v2_user_data)) {
++                case GGML_BACKEND_SCHED_COPY_NOT_HANDLED:
++                    break;
++                case GGML_BACKEND_SCHED_COPY_HANDLED:
++                    return GGML_STATUS_SUCCESS;
++                case GGML_BACKEND_SCHED_COPY_ERROR:
++                default:
++                    return GGML_STATUS_FAILED;
++            }
++        } else if (sched->callback_copy != NULL && sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
++            return GGML_STATUS_SUCCESS;
++        }
+     }
+-
+     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
+     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
+     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+@@ -1860,6 +1871,8 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+         }
+         ggml_backend_tensor_copy(input, input_cpy);
+     }
++
++    return GGML_STATUS_SUCCESS;
+ }
+ 
+ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+@@ -1887,12 +1900,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
+         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+             if (!ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
+-                ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
++                enum ggml_status ec = ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
++                if (ec != GGML_STATUS_SUCCESS) {
++                    ggml_backend_sched_synchronize(sched);
++                    return ec;
++                }
+             }
+         }
+         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+             if (ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
+-                ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
++                enum ggml_status ec = ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
++                if (ec != GGML_STATUS_SUCCESS) {
++                    ggml_backend_sched_synchronize(sched);
++                    return ec;
++                }
+             }
+         }
+ 
+@@ -2155,6 +2176,12 @@ void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backe
+     sched->callback_copy_user_data = user_data;
+ }
+ 
++void ggml_backend_sched_set_copy_callback_v2(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback_v2 callback, void * user_data) {
++    GGML_ASSERT(sched);
++    sched->callback_copy_v2 = callback;
++    sched->callback_copy_v2_user_data = user_data;
++}
++
+ void ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data) {
+     GGML_ASSERT(sched);
+     sched->callback_realloc = callback;
+diff --git a/tests/test-backend-sched-copy-callback.cpp b/tests/test-backend-sched-copy-callback.cpp
+new file mode 100644
+index 0000000..ab34520
+--- /dev/null
++++ b/tests/test-backend-sched-copy-callback.cpp
+@@ -0,0 +1,197 @@
++#include "ggml.h"
++#include "ggml-backend.h"
++#include "../ggml/src/ggml-backend-impl.h"
++#include "ggml-cpu.h"
++
++#include <cstdio>
++#include <memory>
++
++struct backend_deleter {
++    void operator()(ggml_backend * backend) const {
++        ggml_backend_free(backend);
++    }
++};
++
++struct buffer_deleter {
++    void operator()(ggml_backend_buffer * buffer) const {
++        ggml_backend_buffer_free(buffer);
++    }
++};
++
++struct context_deleter {
++    void operator()(ggml_context * context) const {
++        ggml_free(context);
++    }
++};
++
++using backend_ptr = std::unique_ptr<ggml_backend, backend_deleter>;
++using buffer_ptr = std::unique_ptr<ggml_backend_buffer, buffer_deleter>;
++using context_ptr = std::unique_ptr<ggml_context, context_deleter>;
++
++enum copy_mode {
++    COPY_LEGACY_NOT_HANDLED,
++    COPY_LEGACY_HANDLED,
++    COPY_V2_NOT_HANDLED,
++    COPY_V2_HANDLED,
++    COPY_V2_ERROR,
++};
++
++struct callback_data {
++    copy_mode mode;
++    int calls;
++};
++
++static void write_custom_weight(ggml_tensor * dst) {
++    const float values[] = { 10.0f, 11.0f, 12.0f, 13.0f };
++    ggml_backend_tensor_set(dst, values, 0, sizeof(values));
++}
++
++static bool copy_callback_legacy(ggml_backend_t, const ggml_tensor *, ggml_tensor * dst, ggml_cgraph *, void * user_data) {
++    callback_data * data = (callback_data *) user_data;
++    data->calls++;
++    if (data->mode == COPY_LEGACY_HANDLED) {
++        write_custom_weight(dst);
++        return true;
++    }
++    return false;
++}
++
++static ggml_backend_sched_copy_result copy_callback_v2(ggml_backend_t, const ggml_tensor *, ggml_tensor * dst, ggml_cgraph *, void * user_data) {
++    callback_data * data = (callback_data *) user_data;
++    data->calls++;
++    switch (data->mode) {
++        case COPY_V2_NOT_HANDLED:
++            return GGML_BACKEND_SCHED_COPY_NOT_HANDLED;
++        case COPY_V2_HANDLED:
++            write_custom_weight(dst);
++            return GGML_BACKEND_SCHED_COPY_HANDLED;
++        case COPY_V2_ERROR:
++            return GGML_BACKEND_SCHED_COPY_ERROR;
++        default:
++            return GGML_BACKEND_SCHED_COPY_ERROR;
++    }
++}
++
++static ggml_backend_buffer_type custom_buft;
++
++static bool custom_supports_buft(ggml_backend_dev_t, ggml_backend_buffer_type_t buft) {
++    return buft == &custom_buft;
++}
++
++static ggml_backend_buffer_type_t custom_get_buffer_type(ggml_backend_dev_t) {
++    return &custom_buft;
++}
++
++static bool run_case(copy_mode mode) {
++    backend_ptr backend_a(ggml_backend_cpu_init());
++    backend_ptr backend_b(ggml_backend_cpu_init());
++    if (!backend_a || !backend_b) {
++        return false;
++    }
++
++    custom_buft = *ggml_backend_cpu_buffer_type();
++    struct ggml_backend_device custom_dev = *backend_b->device;
++    custom_dev.iface.supports_buft = custom_supports_buft;
++    custom_dev.iface.get_buffer_type = custom_get_buffer_type;
++    custom_buft.device = &custom_dev;
++    backend_b->device = &custom_dev;
++
++    ggml_init_params params = { 1024 * 1024, NULL, true };
++    context_ptr ctx_input(ggml_init(params));
++    context_ptr ctx_weight(ggml_init(params));
++    context_ptr ctx_graph(ggml_init(params));
++    if (!ctx_input || !ctx_weight || !ctx_graph) {
++        return false;
++    }
++
++    ggml_tensor * input = ggml_new_tensor_1d(ctx_input.get(), GGML_TYPE_F32, 4);
++    ggml_tensor * weight = ggml_new_tensor_1d(ctx_weight.get(), GGML_TYPE_F32, 4);
++    buffer_ptr input_buffer(ggml_backend_alloc_ctx_tensors(ctx_input.get(), backend_a.get()));
++    buffer_ptr weight_buffer(ggml_backend_alloc_ctx_tensors(ctx_weight.get(), backend_a.get()));
++    if (!input_buffer || !weight_buffer) {
++        return false;
++    }
++    ggml_backend_buffer_set_usage(weight_buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++
++    const float input_values[] = { 1.0f, 1.0f, 1.0f, 1.0f };
++    const float weight_values[] = { 2.0f, 3.0f, 4.0f, 5.0f };
++    ggml_backend_tensor_set(input, input_values, 0, sizeof(input_values));
++    ggml_backend_tensor_set(weight, weight_values, 0, sizeof(weight_values));
++
++    ggml_tensor * prior = ggml_scale(ctx_graph.get(), input, 3.0f);
++    ggml_tensor * first = ggml_add(ctx_graph.get(), prior, weight);
++    ggml_tensor * second = ggml_scale(ctx_graph.get(), first, 2.0f);
++    ggml_set_output(second);
++    ggml_cgraph * graph = ggml_new_graph(ctx_graph.get());
++    ggml_build_forward_expand(graph, second);
++
++    ggml_backend_t backends[] = { backend_a.get(), backend_b.get() };
++    ggml_backend_buffer_type_t bufts[] = {
++        ggml_backend_cpu_buffer_type(),
++        &custom_buft,
++    };
++    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, bufts, 2, 16, false, false);
++    ggml_backend_sched_set_tensor_backend(sched, input, backend_a.get());
++    ggml_backend_sched_set_tensor_backend(sched, weight, backend_a.get());
++    ggml_backend_sched_set_tensor_backend(sched, prior, backend_a.get());
++    ggml_backend_sched_set_tensor_backend(sched, first, backend_b.get());
++    ggml_backend_sched_set_tensor_backend(sched, second, backend_a.get());
++
++    callback_data data = { mode, 0 };
++    if (mode == COPY_LEGACY_NOT_HANDLED || mode == COPY_LEGACY_HANDLED) {
++        ggml_backend_sched_set_copy_callback(sched, copy_callback_legacy, &data);
++    } else {
++        ggml_backend_sched_set_copy_callback_v2(sched, copy_callback_v2, &data);
++    }
++
++    bool ok = ggml_backend_sched_alloc_graph(sched, graph) && ggml_backend_sched_get_n_splits(sched) == 3;
++    if (ok && mode == COPY_V2_ERROR) {
++        ok = (ggml_backend_sched_graph_compute_async(sched, graph) == GGML_STATUS_FAILED);
++        float first_result[4];
++        float second_result[4];
++        float prior_result[4];
++        ggml_backend_tensor_get(prior, prior_result, 0, sizeof(prior_result));
++        ggml_backend_tensor_get(first, first_result, 0, sizeof(first_result));
++        ggml_backend_tensor_get(second, second_result, 0, sizeof(second_result));
++        for (int i = 0; i < 4; i++) {
++            const float computed_first = (input_values[i] * 3.0f + weight_values[i]);
++            const float computed_second = computed_first * 2.0f;
++            ok = ok && prior_result[i] == input_values[i] * 3.0f &&
++                first_result[i] != computed_first && second_result[i] != computed_second;
++        }
++    } else if (ok) {
++        ok = (ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
++        const float expected_weight[] = {
++            mode == COPY_LEGACY_HANDLED || mode == COPY_V2_HANDLED ? 10.0f : 2.0f,
++            mode == COPY_LEGACY_HANDLED || mode == COPY_V2_HANDLED ? 11.0f : 3.0f,
++            mode == COPY_LEGACY_HANDLED || mode == COPY_V2_HANDLED ? 12.0f : 4.0f,
++            mode == COPY_LEGACY_HANDLED || mode == COPY_V2_HANDLED ? 13.0f : 5.0f,
++        };
++        float result[4];
++        ggml_backend_tensor_get(second, result, 0, sizeof(result));
++        for (int i = 0; i < 4; i++) {
++            ok = ok && result[i] == (input_values[i] * 3.0f + expected_weight[i]) * 2.0f;
++        }
++    }
++
++    ok = ok && data.calls == 1;
++    ggml_backend_sched_free(sched);
++    return ok;
++}
++
++int main() {
++    const copy_mode modes[] = {
++        COPY_LEGACY_NOT_HANDLED,
++        COPY_LEGACY_HANDLED,
++        COPY_V2_NOT_HANDLED,
++        COPY_V2_HANDLED,
++        COPY_V2_ERROR,
++    };
++    for (copy_mode mode : modes) {
++        if (!run_case(mode)) {
++            std::fprintf(stderr, "scheduler copy callback test failed for mode %d\n", (int) mode);
++            return 1;
++        }
++    }
++    return 0;
++}

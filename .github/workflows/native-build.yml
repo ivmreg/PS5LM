@@ -12,7 +12,7 @@ jobs:
   host-checks:
     name: Host regression tests and script syntax
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -25,6 +25,8 @@ jobs:
         run: git submodule update --init --depth 1 -- third_party/llama.cpp third_party/ps5-homebrew-ui
       - name: Run host regression suites
         run: bash scripts/test-host.sh
+      - name: Build and run patched MoE engine CPU tests
+        run: bash scripts/test-moe-engine.sh
 
   ps5-title:
     name: Full PS5 title cross-build and static package checks

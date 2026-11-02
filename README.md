@@ -67,6 +67,10 @@ no PC while it runs, no cloud and no account.
 | Qwen 3.8 27B, UD-Q2_K_XL | 9.2 GB | about 20 tokens a second, 64k context |
 | d1 Omni 600M, a decision model | 1.1 GB | 3 questions in 0.3 s; a 720p image and 7 questions in 2.9 s |
 
+> **Experimental: paged MoE.** On-demand MoE expert paging is experimental and
+> has not been measured on PS5 hardware. Host CPU tests use a tiny synthetic
+> fixture; they do not establish console inference or performance.
+
 ## Decision models, powered by Ollaya
 
 [Ollaya](https://github.com/ollaya-dev/ollaya) runs open decision models on a PC the way Ollama runs

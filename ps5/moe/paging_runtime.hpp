@@ -5,6 +5,7 @@
 #include "expert_source.hpp"
 #include "slot_cache.hpp"
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -15,6 +16,8 @@
 namespace ps5lm::moe {
 
 using UploadToken = std::uint64_t;
+
+inline constexpr std::size_t kHardMaxUploadBatchCapacity = 8;
 
 enum class ExpertTensorRole : std::uint8_t { Gate, Up, Down };
 
@@ -38,6 +41,13 @@ enum class TransferFenceStatus : std::uint8_t {
     Indeterminate,
 };
 
+struct QuarantinedTransferInfo {
+    UploadToken token = 0;
+    ExpertKey key{};
+    ExpertTensorRole role = ExpertTensorRole::Gate;
+    std::size_t slot = kNoSlot;
+};
+
 struct UploadSubmission {
     // false guarantees that no work was accepted and the source pointer is no
     // longer retained. true requires a valid token unless the caller will
@@ -47,9 +57,11 @@ struct UploadSubmission {
 };
 
 // Backend contract: submit_upload() may retain source_bytes only while its
-// returned token is outstanding. wait_transfer() must return Complete or
-// FailedButQuiesced only when it guarantees no further source/destination
-// access. Indeterminate means the caller cannot reuse either resource.
+// returned token is outstanding. PagingRuntime may have up to the configured
+// batch capacity of uploads outstanding, each with a distinct source slice.
+// A wait result may be Complete or FailedButQuiesced only when it guarantees
+// no further source/destination access. Indeterminate means the caller cannot
+// reuse either resource.
 class ExpertUploadBackend {
 public:
     virtual ~ExpertUploadBackend() = default;
@@ -62,6 +74,20 @@ public:
             std::size_t byte_count) noexcept = 0;
 
     virtual TransferFenceStatus wait_transfer(UploadToken token) noexcept = 0;
+
+    // Optional backend batch fence. The default waits every token separately
+    // and fills one status per token, even if an earlier wait is indeterminate.
+    // Overrides may use one aggregate synchronization only when its result
+    // proves the corresponding per-token status guarantees. For count > 0,
+    // both arrays are non-null and statuses[i] corresponds to tokens[i].
+    virtual void wait_transfers(
+            const UploadToken * tokens,
+            std::size_t count,
+            TransferFenceStatus * statuses) noexcept {
+        for (std::size_t i = 0; i < count; ++i) {
+            statuses[i] = wait_transfer(tokens[i]);
+        }
+    }
 
     // Stops/drains all accepted transfers. Only Complete or FailedButQuiesced
     // confirms that no outstanding transfer can access staging or cache slots.
@@ -104,22 +130,50 @@ enum class QuarantineStatus : std::uint8_t {
     StillUnsafe,
 };
 
-// Owns exactly one fixed reusable staging buffer. If a transfer fence becomes
-// indeterminate it also owns the active reservation, preventing slot rollback
-// and staging destruction until backend-wide quiescence is confirmed.
+// Owns a fixed staging pool sized by per-buffer capacity times upload batch
+// capacity. The default batch capacity is one; larger pools must be explicitly
+// requested and accounted for by the caller. If a transfer fence becomes
+// indeterminate it also owns the active reservation until backend-wide
+// quiescence is confirmed.
 class PagingQuarantine final {
 public:
-    explicit PagingQuarantine(std::size_t staging_capacity);
+    // staging_capacity is bytes per source slice. Requests above the hard
+    // batch limit, zero capacities, and multiplication overflow produce an
+    // invalid empty pool. Callers opting into more than one slice must budget
+    // the full staging_capacity * upload_batch_capacity allocation first.
+    explicit PagingQuarantine(
+            std::size_t staging_capacity,
+            std::size_t upload_batch_capacity = 1);
     ~PagingQuarantine() noexcept;
     PagingQuarantine(const PagingQuarantine &) = delete;
     PagingQuarantine & operator=(const PagingQuarantine &) = delete;
 
-    std::size_t staging_capacity() const noexcept { return staging_.size(); }
+    // Per-slice capacity; total allocation is staging_capacity() multiplied
+    // by upload_batch_capacity().
+    std::size_t staging_capacity() const noexcept { return staging_capacity_; }
+    std::size_t upload_batch_capacity() const noexcept { return upload_batch_capacity_; }
+    std::size_t total_staging_bytes() const noexcept { return staging_.size(); }
     bool pending() const noexcept { return pending_.has_value(); }
-    UploadToken pending_transfer() const noexcept { return pending_transfer_; }
-    ExpertKey pending_key() const noexcept { return pending_key_; }
-    ExpertTensorRole pending_role() const noexcept { return pending_role_; }
-    std::size_t pending_slot() const noexcept { return pending_slot_; }
+    std::size_t pending_transfer_count() const noexcept { return pending_transfer_count_; }
+    const QuarantinedTransferInfo * pending_transfer_info(std::size_t index) const noexcept {
+        return index < pending_transfer_count_ ? &pending_transfers_[index] : nullptr;
+    }
+    UploadToken pending_transfer() const noexcept {
+        const auto * info = pending_transfer_info(0);
+        return info ? info->token : 0;
+    }
+    ExpertKey pending_key() const noexcept {
+        const auto * info = pending_transfer_info(0);
+        return info ? info->key : ExpertKey{};
+    }
+    ExpertTensorRole pending_role() const noexcept {
+        const auto * info = pending_transfer_info(0);
+        return info ? info->role : ExpertTensorRole::Gate;
+    }
+    std::size_t pending_slot() const noexcept {
+        const auto * info = pending_transfer_info(0);
+        return info ? info->slot : kNoSlot;
+    }
 
     // This method calls backend.quiesce(). It releases the reservation only
     // after a result that guarantees no transfer remains in flight.
@@ -132,19 +186,17 @@ private:
     void release() noexcept;
     void quarantine(
             Reservation && reservation,
-            ExpertKey key,
-            ExpertTensorRole role,
-            std::size_t slot,
-            UploadToken transfer) noexcept;
+            const QuarantinedTransferInfo * transfers,
+            std::size_t transfer_count) noexcept;
 
     std::vector<std::uint8_t> staging_;
+    std::size_t staging_capacity_ = 0;
+    std::size_t upload_batch_capacity_ = 0;
     std::optional<Reservation> pending_;
     bool leased_ = false;
     ExpertUploadBackend * backend_ = nullptr;
-    UploadToken pending_transfer_ = 0;
-    ExpertKey pending_key_{};
-    ExpertTensorRole pending_role_ = ExpertTensorRole::Gate;
-    std::size_t pending_slot_ = kNoSlot;
+    std::array<QuarantinedTransferInfo, kHardMaxUploadBatchCapacity> pending_transfers_{};
+    std::size_t pending_transfer_count_ = 0;
 };
 
 class PagingRuntime final {

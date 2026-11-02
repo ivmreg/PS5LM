@@ -9,12 +9,17 @@ non-`Ok` result.
 The caller must validate GGUF tensor metadata before constructing immutable
 `ExpertTensorDescriptor` values. Descriptors are checked again for overflow,
 shard bounds, unique tensor IDs, consistent shard size/identity, and staging
-cap. The source checks each open shard with `fstat`; when device/inode identity
-is available it also checks the path still names the opened file on each read.
-It checks exact file length on open and before every expert read. Filesystems
-without a usable inode identity receive length checks only. Same-size content
-corruption cannot be detected without a trusted content hash; this component
-does not hash full shards.
+cap. The source checks each open shard with `fstat` and `stat`. On every expert
+read, an identity-backed shard gets one `stat` of its path; matching
+device/inode proves it still names the retained file handle, and that same
+result checks the file length. If identity is unavailable, the source uses
+one `fstat` for the retained handle's length. Filesystems without a usable
+inode identity receive length checks only. These checks happen for every
+call, with no cached layer-wide validation. A replacement or truncation
+racing after the metadata check can still race the read; `pread` reads from
+the retained handle and the exact-read loop fails if EOF interrupts the
+requested slice. Same-size content corruption cannot be detected without a
+trusted content hash; this component does not hash full shards.
 
 Every read returns a structured `ReadError` and is `noexcept`. `pread` retries
 `EINTR`, continues after partial reads, reports EOF before the requested slice

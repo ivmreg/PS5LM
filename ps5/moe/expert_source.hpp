@@ -8,6 +8,7 @@
 #include <vector>
 
 #ifdef PS5LM_MOE_EXPERT_SOURCE_TESTING
+#include <sys/stat.h>
 #include <sys/types.h>
 #endif
 
@@ -73,8 +74,15 @@ struct OpenOptions {
 #ifdef PS5LM_MOE_EXPERT_SOURCE_TESTING
     // Fault-injection seam for deterministic short-read and EINTR tests.
     using PreadFunction = ssize_t (*)(int, void *, std::size_t, off_t, void *);
+    using StatFunction = int (*)(const char *, struct stat *, void *);
+    using FstatFunction = int (*)(int, struct stat *, void *);
     PreadFunction pread_for_test = nullptr;
     void * pread_user_data = nullptr;
+    // Test seam to count and exercise metadata-check selection. Callbacks
+    // should delegate to ::stat/::fstat so they preserve system-call behavior.
+    StatFunction stat_for_test = nullptr;
+    FstatFunction fstat_for_test = nullptr;
+    void * metadata_user_data = nullptr;
 #endif
 };
 
@@ -97,9 +105,13 @@ public:
             const std::vector<ExpertTensorDescriptor> & tensors,
             OpenOptions options) noexcept;
 
-    // Reads exactly one quantized expert slice into caller-owned storage. On
-    // any failure, the destination may contain partial bytes and must be
-    // treated as invalid. Cancellation is checked between pread calls.
+    // Checks the shard's current size and (when available) path identity, then
+    // reads exactly one quantized expert slice from the retained file handle.
+    // Validation is per call, so concurrent calls share no cached check state.
+    // A path replacement or truncation racing after validation can still race
+    // that read; exact reads detect EOF within the requested slice. On any
+    // failure, the destination may contain partial bytes and is invalid.
+    // Cancellation is checked between pread calls.
     ReadError read_expert(
             std::uint64_t tensor_id,
             std::uint64_t expert_id,
@@ -121,6 +133,9 @@ private:
 #ifdef PS5LM_MOE_EXPERT_SOURCE_TESTING
     OpenOptions::PreadFunction pread_for_test_ = nullptr;
     void * pread_user_data_ = nullptr;
+    OpenOptions::StatFunction stat_for_test_ = nullptr;
+    OpenOptions::FstatFunction fstat_for_test_ = nullptr;
+    void * metadata_user_data_ = nullptr;
 #endif
 };
 

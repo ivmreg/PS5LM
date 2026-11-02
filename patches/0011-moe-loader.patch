@@ -1,0 +1,938 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 6bc4a84..9d48ecd 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -2786,6 +2786,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.moe_cache_size = (size_t) value*1024*1024;
+         }
+     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
++    add_opt(common_arg(
++        {"--paged-moe"},
++        "enable on-demand MoE expert paging from GGUF storage (requires positive --moe-cache-mib, forces -ub 1 -np 1)",
++        [](common_params & params) {
++            params.use_moe_expert_paging = true;
++            params.n_ubatch = 1;
++            params.n_parallel = 1;
++            params.fit_params = false;
++            params.no_extra_bufts = true;
++            params.load_mode = LLAMA_LOAD_MODE_NONE;
++            params.split_mode = LLAMA_SPLIT_MODE_NONE;
++            params.lazy_mode = LLAMA_LAZY_MODE_OFF;
++        }
++    ).set_env("LLAMA_ARG_PAGED_MOE"));
+     add_opt(common_arg(
+         {"-ncffn", "--n-cpu-ffn"}, "N",
+         "keep the dense FFN weights of the first N layers in the CPU\n"
+diff --git a/common/common.cpp b/common/common.cpp
+index d82a5ee..d29ec3c 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1261,7 +1261,7 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+     auto mparams = common_model_params_to_llama(params);
+     auto cparams = common_context_params_to_llama(params);
+ 
+-    if (params.fit_params) {
++    if (params.fit_params && !params.use_moe_expert_paging) {
+         COM_TRC("%s", "fitting params to device memory ...\n");
+         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
+ 
+@@ -1722,6 +1722,19 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+     mparams.progress_callback           = params.load_progress_callback;
+     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
+     mparams.no_alloc                    = params.no_alloc;
++    mparams.use_moe_expert_paging       = params.use_moe_expert_paging;
++    if (params.use_moe_expert_paging) {
++        if (mparams.load_mode == LLAMA_LOAD_MODE_AUTO) {
++            mparams.load_mode = LLAMA_LOAD_MODE_NONE;
++        }
++        if (mparams.lazy_mode == LLAMA_LAZY_MODE_AUTO) {
++            mparams.lazy_mode = LLAMA_LAZY_MODE_OFF;
++        }
++        if (mparams.split_mode == LLAMA_SPLIT_MODE_LAYER) {
++            mparams.split_mode = LLAMA_SPLIT_MODE_NONE;
++        }
++        mparams.use_extra_bufts = false;
++    }
+     mparams.load_mtp                    = params.load_mtp || std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+ 
+     return mparams;
+diff --git a/common/common.h b/common/common.h
+index b6bb185..e6b8f79 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -598,6 +598,7 @@ struct common_params {
+     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+ 
+     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
++    bool use_moe_expert_paging = false; // enable on-demand MoE expert paging from GGUF storage
+ 
+     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
+ 
+diff --git a/include/llama.h b/include/llama.h
+index f15ca9f..5cdd6c6 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -354,6 +354,7 @@ extern "C" {
+         bool no_host;         // bypass host buffer allowing extra buffers to be used
+         bool no_alloc;        // only load metadata and simulate memory allocations
+         bool load_mtp;        // whether to load MTP layers
++        bool use_moe_expert_paging; // experimental: retain Qwen3MoE expert descriptors without loading expert data
+     };
+ 
+     struct llama_sampler_seq_config {
+@@ -1131,6 +1132,9 @@ extern "C" {
+     // and is not necessary to call it explicitly in most cases
+     LLAMA_API void llama_synchronize(struct llama_context * ctx);
+ 
++    // Test fault injection for MoE cache/paging
++    LLAMA_API void llama_moe_set_fault_injection(struct llama_context * ctx, bool enable, int countdown);
++
+     // Token logits obtained from the last call to llama_decode()
+     // The logits for which llama_batch.logits[i] != 0 are stored contiguously
+     // in the order they have appeared in the batch.
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 97250c2..46a2fa1 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -44,6 +44,19 @@ set(LLAMA_CORE_SOURCES
+     unicode.cpp
+ )
+ 
++set(PS5LM_MOE_SOURCE_DIR "" CACHE PATH "PS5LM MoE pager source directory")
++if (NOT EXISTS "${PS5LM_MOE_SOURCE_DIR}/expert_source.hpp" OR
++    NOT EXISTS "${PS5LM_MOE_SOURCE_DIR}/slot_cache.hpp" OR
++    NOT EXISTS "${PS5LM_MOE_SOURCE_DIR}/paging_runtime.hpp")
++    message(FATAL_ERROR "Set PS5LM_MOE_SOURCE_DIR to the PS5LM ps5/moe directory")
++endif()
++if (NOT WIN32)
++    list(APPEND LLAMA_CORE_SOURCES
++        "${PS5LM_MOE_SOURCE_DIR}/expert_source.cpp"
++        "${PS5LM_MOE_SOURCE_DIR}/slot_cache.cpp"
++        "${PS5LM_MOE_SOURCE_DIR}/paging_runtime.cpp")
++endif()
++
+ add_library(llama
+             ../include/llama.h
+             ${LLAMA_CORE_SOURCES}
+@@ -65,7 +78,7 @@ set_source_files_properties(${LLAMA_CORE_SOURCES} ../include/llama.h unicode.h
+ 
+ configure_file(llama-version.h.in ${CMAKE_CURRENT_BINARY_DIR}/llama-version.h @ONLY)
+ 
+-target_include_directories(llama PRIVATE . ${CMAKE_CURRENT_BINARY_DIR})
++target_include_directories(llama PRIVATE . ${CMAKE_CURRENT_BINARY_DIR} "${PS5LM_MOE_SOURCE_DIR}")
+ target_include_directories(llama PUBLIC ../include)
+ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
+ 
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index bc93c6f..0c28819 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -15,6 +15,10 @@
+ #include <regex>
+ #include <unordered_set>
+ 
++#if !defined(_WIN32)
++#include <sys/stat.h>
++#endif
++
+ static const size_t kiB = 1024;
+ static const size_t MiB = 1024*kiB;
+ static const size_t GiB = 1024*MiB;
+@@ -541,9 +545,16 @@ llama_model_loader::llama_model_loader(
+         bool check_tensors,
+         bool no_alloc,
+         bool load_mtp,
++        bool use_moe_expert_paging,
+         const llama_model_kv_override * param_overrides_p,
+         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
+         : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
++    this->use_moe_expert_paging = use_moe_expert_paging;
++
++    if (use_moe_expert_paging && fname.empty()) {
++        throw std::runtime_error("MoE expert paging requires a regular GGUF file path; file-pointer loading is unsupported");
++    }
++
+     int trace = 0;
+     if (getenv("LLAMA_TRACE")) {
+         trace = atoi(getenv("LLAMA_TRACE"));
+@@ -559,6 +570,12 @@ llama_model_loader::llama_model_loader(
+ 
+     this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK || load_mode == LLAMA_LOAD_MODE_AUTO;
+     this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
++    if (use_moe_expert_paging) {
++        // Page mode uses independent POSIX descriptors and must not touch the
++        // model's tensor payload through a whole-file mapping.
++        this->use_mmap = false;
++        this->use_direct_io = false;
++    }
+ 
+     if (!fname.empty()) {
+         // Load the main GGUF
+@@ -577,7 +594,12 @@ llama_model_loader::llama_model_loader(
+         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
+         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+ 
++        if (use_moe_expert_paging && llm_kv.arch != LLM_ARCH_QWEN3MOE) {
++            throw std::runtime_error("MoE expert paging currently supports only Qwen3MoE architecture");
++        }
++
+         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
++        file_paths.emplace_back(fname);
+         contexts.emplace_back(ctx);
+ 
+         // Save tensors data offset of the main file.
+@@ -596,6 +618,10 @@ llama_model_loader::llama_model_loader(
+         uint16_t n_split = 0;
+         get_key(llm_kv(LLM_KV_SPLIT_COUNT), n_split, false);
+ 
++        if (use_moe_expert_paging && n_split > 1) {
++            throw std::runtime_error("MoE expert paging does not support split GGUF models");
++        }
++
+         // Load additional GGML contexts
+         if (n_split > 1) {
+             // make sure the main file is loaded first
+@@ -646,6 +672,7 @@ llama_model_loader::llama_model_loader(
+                 }
+ 
+                 files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
++                file_paths.emplace_back(fname_split);
+                 contexts.emplace_back(ctx);
+ 
+                 // Save tensors data offset info of the shard.
+@@ -697,6 +724,7 @@ llama_model_loader::llama_model_loader(
+         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+ 
+         files.emplace_back(new llama_file(file));
++        file_paths.emplace_back();
+         contexts.emplace_back(ctx);
+ 
+         // Save tensors data offset info of the main file.
+@@ -715,6 +743,14 @@ llama_model_loader::llama_model_loader(
+         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+     }
+ 
++    if (use_moe_expert_paging) {
++        for (const auto & entry : weights_map) {
++            if (entry.first.find(".ffn_gate_up_exps.weight") != std::string::npos) {
++                throw std::runtime_error("MoE expert paging does not support merged gate/up expert tensors");
++            }
++        }
++    }
++
+     n_kv      = gguf_get_n_kv(metadata);
+     n_tensors = weights_map.size();
+ 
+@@ -1120,8 +1156,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+     // set below, before buft_for_tensor() runs
+     bool is_lazy = false;
+ 
++    bool is_paged = false;
++
+     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+-        const ctx_key key { buft, is_lazy };
++        const ctx_key key { buft, is_lazy, is_paged };
+ 
+         auto it = ctx_map.find(key);
+         if (it == ctx_map.end()) {
+@@ -1213,6 +1251,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+             return lazy_read::buft();
+         }
+ 
++        if (is_paged) {
++            auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++            if (!cpu_dev) {
++                throw std::runtime_error("MoE expert paging requires a CPU backend");
++            }
++            return ggml_backend_dev_buffer_type(cpu_dev);
++        }
++
+         // select the buffer type for this tensor
+         const buft_list_t * buft_list;
+         switch (info.layer) {
+@@ -1340,6 +1386,61 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         return NULL;
+     }
+ 
++    const std::string tensor_name = tn.str();
++    if (use_moe_expert_paging) {
++        const bool is_gate_up_down_expert =
++            tensor_name.size() > 0 &&
++            tensor_name.rfind(".weight") == tensor_name.size() - 7 &&
++            (tensor_name.find(".ffn_gate_exps.weight") != std::string::npos ||
++             tensor_name.find(".ffn_up_exps.weight")   != std::string::npos ||
++             tensor_name.find(".ffn_down_exps.weight") != std::string::npos);
++        if (is_gate_up_down_expert) {
++            if (ne.size() != 3 || ggml_n_dims(cur) != 3 || cur->ne[2] != hparams.n_expert || cur->ne[2] <= 0) {
++                throw std::runtime_error(format("unsupported Qwen3MoE expert tensor layout for %s", tensor_name.c_str()));
++            }
++            const uint64_t tensor_bytes = ggml_nbytes(cur);
++            const uint64_t expert_count = static_cast<uint64_t>(cur->ne[2]);
++            if (tensor_bytes == 0 || tensor_bytes % expert_count != 0 || cur->nb[2] != tensor_bytes / expert_count) {
++                throw std::runtime_error(format("non-contiguous Qwen3MoE expert tensor layout for %s", tensor_name.c_str()));
++            }
++
++            const auto & weight = require_weight(tensor_name.c_str());
++            if (weight.idx >= files.size() || weight.idx >= file_paths.size() || file_paths[weight.idx].empty()) {
++                throw std::runtime_error(format("expert tensor %s has no reopenable shard path", tensor_name.c_str()));
++            }
++            const uint64_t file_size = static_cast<uint64_t>(files[weight.idx]->size());
++            if (weight.offs > file_size || tensor_bytes > file_size - weight.offs) {
++                throw std::runtime_error(format("expert tensor %s lies outside its source shard", tensor_name.c_str()));
++            }
++
++            ps5lm::moe::FileIdentity identity{};
++#if !defined(_WIN32)
++            struct stat st;
++            if (stat(file_paths[weight.idx].c_str(), &st) != 0 || st.st_size < 0 || static_cast<uint64_t>(st.st_size) != file_size) {
++                throw std::runtime_error(format("unable to validate source shard identity for %s", tensor_name.c_str()));
++            }
++            identity.available = true;
++            identity.device = static_cast<uint64_t>(st.st_dev);
++            identity.inode = static_cast<uint64_t>(st.st_ino);
++#else
++            throw std::runtime_error("MoE expert paging requires POSIX file identity support");
++#endif
++            const uint64_t id = next_paged_expert_tensor_id++;
++            paged_expert_descriptors.push_back({
++                id,
++                weight.idx,
++                static_cast<uint64_t>(weight.offs),
++                tensor_bytes,
++                expert_count,
++                static_cast<uint64_t>(cur->nb[2]),
++                file_size,
++                identity,
++            });
++            paged_expert_tensor_ids.emplace(tensor_name, id);
++            is_paged = true;
++        }
++    }
++
+     if (flags & TENSOR_READ_LAZY) {
+         // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
+         is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
+@@ -1390,6 +1491,17 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+     return tensor;
+ }
+ 
++#if !defined(_WIN32)
++ps5lm::moe::OpenResult llama_model_loader::open_paged_expert_source(std::size_t max_expert_bytes) const {
++    std::vector<ps5lm::moe::ShardPath> paths;
++    paths.reserve(file_paths.size());
++    for (const auto & path : file_paths) {
++        paths.push_back({path});
++    }
++    return ps5lm::moe::ExpertSource::open(paths, paged_expert_descriptors, {max_expert_bytes});
++}
++#endif
++
+ void llama_model_loader::done_getting_tensors(bool partial) const {
+     if (n_created > n_tensors) {
+         throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_created));
+@@ -1443,6 +1555,9 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
+ 
+     // compute the total size of all tensors for progress reporting
+     for (const auto & it : weights_map) {
++        if (use_moe_expert_paging && paged_expert_tensor_ids.count(it.first) != 0) {
++            continue;
++        }
+         size_data += ggml_nbytes(it.second.tensor);
+     }
+ }
+diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
+index ed59079..0f0b85b 100644
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -6,6 +6,7 @@
+ #include "llama-arch.h"
+ #include "llama-hparams.h"
+ #include "llama-mmap.h"
++#include "expert_source.hpp"
+ 
+ #include "ggml-cpp.h"
+ 
+@@ -81,6 +82,14 @@ struct llama_model_loader {
+     bool check_tensors;
+     bool no_alloc;
+     bool load_mtp;
++    bool use_moe_expert_paging = false;
++
++    // Keep source paths parallel to files so expert descriptors can reopen a
++    // pinned read-only handle after the ordinary llama_file objects are gone.
++    std::vector<std::string> file_paths;
++    std::vector<ps5lm::moe::ExpertTensorDescriptor> paged_expert_descriptors;
++    std::unordered_map<std::string, uint64_t> paged_expert_tensor_ids;
++    uint64_t next_paged_expert_tensor_id = 1;
+ 
+     // handle TENSOR_READ_LAZY
+     // use case: keep PLE / engrams embd tensors on disk, read them on demand
+@@ -149,6 +158,7 @@ struct llama_model_loader {
+     struct ctx_key {
+         ggml_backend_buffer_type_t buft;
+         bool lazy;
++        bool paged;
+     };
+ 
+     struct ctx_key_comparator {
+@@ -156,6 +166,9 @@ struct llama_model_loader {
+             if (lhs.lazy != rhs.lazy) {
+                 return lhs.lazy < rhs.lazy;
+             }
++            if (lhs.paged != rhs.paged) {
++                return lhs.paged < rhs.paged;
++            }
+             return strcmp(ggml_backend_buft_name(lhs.buft), ggml_backend_buft_name(rhs.buft)) < 0;
+         }
+     };
+@@ -180,6 +193,7 @@ struct llama_model_loader {
+         bool check_tensors,
+         bool no_alloc,
+         bool load_mtp,
++        bool use_moe_expert_paging,
+         const llama_model_kv_override * param_overrides_p,
+         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
+ 
+@@ -238,6 +252,8 @@ struct llama_model_loader {
+ 
+     void done_getting_tensors(bool partial = false) const;
+ 
++    ps5lm::moe::OpenResult open_paged_expert_source(std::size_t max_expert_bytes) const;
++
+     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
+ 
+     // byte range within a mapped file
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index aeab7b7..1bfb12c 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1265,6 +1265,12 @@ struct llama_model::impl {
+     bool has_tensor_overrides;
+ 
+     std::vector<float> tensor_split_owned;
++
++#if !defined(_WIN32)
++    // Own the read-only source for as long as model tensor descriptors live.
++    std::unique_ptr<ps5lm::moe::ExpertSource> paged_expert_source;
++    std::unordered_map<const ggml_tensor *, uint64_t> paged_expert_tensor_ids;
++#endif
+ };
+ 
+ bool llama_prec_policy::apply(ggml_tensor * res) const {
+@@ -1849,6 +1855,25 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+ 
+     ml.done_getting_tensors();
+ 
++    if (ml.use_moe_expert_paging) {
++        if (ml.paged_expert_descriptors.size() != static_cast<std::size_t>(n_layer_all) * 3) {
++            throw std::runtime_error(format("Qwen3MoE paging expected %d layers with gate/up/down tensors, found %zu expert tensors",
++                n_layer_all, ml.paged_expert_descriptors.size()));
++        }
++#if !defined(_WIN32)
++        constexpr std::size_t max_expert_bytes = 64 * 1024 * 1024;
++        auto opened = ml.open_paged_expert_source(max_expert_bytes);
++        if (!opened.ok()) {
++            throw std::runtime_error(format("failed to open paged expert source (%s): %s",
++                ps5lm::moe::read_status_name(opened.error.status), opened.error.message));
++        }
++        pimpl->paged_expert_source = std::move(opened.source);
++        has_paged_experts = true;
++#else
++        throw std::runtime_error("MoE expert paging requires POSIX file descriptor support");
++#endif
++    }
++
+     if (per_layer_tok_embd && ml.lazy.has(per_layer_tok_embd)) {
+         LLAMA_LOG_INFO("%s: enabling prefetch for '%s'\n", __func__, per_layer_tok_embd->name);
+ 
+@@ -1865,6 +1890,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     for (auto & [_, ctx_ptr] : ml.ctx_map) {
+         for (auto * cur = ggml_get_first_tensor(ctx_ptr.get()); cur != NULL; cur = ggml_get_next_tensor(ctx_ptr.get(), cur)) {
+             tensors_by_name.emplace_back(ggml_get_name(cur), cur);
++#if !defined(_WIN32)
++            const auto paged_id = ml.paged_expert_tensor_ids.find(ggml_get_name(cur));
++            if (paged_id != ml.paged_expert_tensor_ids.end()) {
++                pimpl->paged_expert_tensor_ids.emplace(cur, paged_id->second);
++            }
++#endif
+         }
+     }
+ 
+@@ -1934,7 +1965,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+             }
+         } else {
+             ggml_backend_buffer_t buf;
+-            if (ml.no_alloc) {
++            if (ml.no_alloc || ctx_key.paged) {
+                 buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
+                 for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
+@@ -1967,7 +1998,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+ 
+         pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
+ 
+-        ctx_bufs.emplace_back(ctx, std::move(buf_ptrs));
++        if (!ctx_key.paged) {
++            ctx_bufs.emplace_back(ctx, std::move(buf_ptrs));
++        }
+     }
+ 
+     if (llama_supports_gpu_offload()) {
+@@ -2019,6 +2052,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         }
+     }
+ 
++#if !defined(_WIN32)
++    if (ml.use_moe_expert_paging && !ml.paged_expert_descriptors.empty()) {
++        size_t max_expert_bytes = 0;
++        for (const auto & desc : ml.paged_expert_descriptors) {
++            max_expert_bytes = std::max(max_expert_bytes, static_cast<size_t>(desc.expert_stride_bytes));
++        }
++        auto open_res = ml.open_paged_expert_source(max_expert_bytes);
++        if (!open_res.ok()) {
++            throw std::runtime_error(format("failed to open paged expert source: %s", open_res.error.message));
++        }
++        pimpl->paged_expert_source = std::move(open_res.source);
++        has_paged_experts = true;
++    }
++#endif
++
+     load_tensors_hadamard();
+ 
+     return true;
+@@ -2716,6 +2764,34 @@ bool llama_model::has_tensor_overrides() const {
+     return pimpl->has_tensor_overrides;
+ }
+ 
++const ps5lm::moe::ExpertSource * llama_model::paged_expert_source() const {
++#if !defined(_WIN32)
++    return pimpl->paged_expert_source.get();
++#else
++    return nullptr;
++#endif
++}
++
++bool llama_model::paged_expert_tensor_id(const struct ggml_tensor * tensor, uint64_t * id_out) const {
++#if !defined(_WIN32)
++    if (!tensor) {
++        return false;
++    }
++    auto it = pimpl->paged_expert_tensor_ids.find(tensor);
++    if (it == pimpl->paged_expert_tensor_ids.end()) {
++        return false;
++    }
++    if (id_out) {
++        *id_out = it->second;
++    }
++    return true;
++#else
++    GGML_UNUSED(tensor);
++    GGML_UNUSED(id_out);
++    return false;
++#endif
++}
++
+ const ggml_tensor * llama_model::get_tensor(const char * name) const {
+     auto it = std::find_if(tensors_by_name.begin(), tensors_by_name.end(),
+             [name](const std::pair<std::string, ggml_tensor *> & it) {
+@@ -3346,6 +3422,7 @@ llama_model_params llama_model_default_params() {
+         /*.no_host                     =*/ false,
+         /*.no_alloc                    =*/ false,
+         /*.load_mtp                    =*/ false,
++        /*.use_moe_expert_paging       =*/ false,
+     };
+ 
+     return result;
+diff --git a/src/llama-model.h b/src/llama-model.h
+index bc640e0..11932e8 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "llama.h"
++#include "expert_source.hpp"
+ #include "llama-arch.h"
+ #include "llama-graph.h"
+ #include "llama-hparams.h"
+@@ -693,6 +694,9 @@ struct llama_model {
+     // see llama_model_set_attn_rot
+     bool attn_rot = true;
+ 
++    // Page mode is metadata-only until the cache and graph callback are integrated.
++    bool has_paged_experts = false;
++
+     // for classifier models
+     std::vector<std::string> classifier_labels;
+ 
+@@ -831,6 +835,9 @@ struct llama_model {
+ 
+     const struct ggml_tensor * get_tensor(const char * name) const;
+ 
++    const ps5lm::moe::ExpertSource * paged_expert_source() const;
++    bool paged_expert_tensor_id(const struct ggml_tensor * tensor, uint64_t * id_out) const;
++
+     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
+     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;
+ 
+diff --git a/src/llama-quant.cpp b/src/llama-quant.cpp
+index 9c60667..a59ac9b 100644
+--- a/src/llama-quant.cpp
++++ b/src/llama-quant.cpp
+@@ -974,7 +974,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
+     const llama_model_kv_override * kv_overrides = params->kv_overrides;
+     std::vector<std::string> splits = {};
+     llama_model_loader ml(/*metadata*/ nullptr, /*set_tensor_data*/ nullptr, /*set_tensor_data_ud*/ nullptr,
+-        fname_inp, splits, /*file*/ nullptr, /*load_mode*/ load_mode, /*check_tensors*/ true, /*no_alloc*/ false, /*load_mtp*/ true, kv_overrides, nullptr);
++        fname_inp, splits, /*file*/ nullptr, /*load_mode*/ load_mode, /*check_tensors*/ true, /*no_alloc*/ false, /*load_mtp*/ true, /*use_moe_expert_paging*/ false, kv_overrides, nullptr);
+     ml.init_mappings(false); // no prefetching
+ 
+     auto mparams = llama_model_default_params();
+diff --git a/src/llama.cpp b/src/llama.cpp
+index 9beb148..0f2d6a3 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -316,8 +316,33 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
+ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
+         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
+     try {
++        if (params.use_moe_expert_paging) {
++#if defined(_WIN32)
++            throw std::runtime_error("MoE expert paging requires POSIX file descriptor support");
++#endif
++            if (params.load_mode == LLAMA_LOAD_MODE_AUTO) {
++                params.load_mode = LLAMA_LOAD_MODE_NONE;
++            }
++            if (params.lazy_mode == LLAMA_LAZY_MODE_AUTO) {
++                params.lazy_mode = LLAMA_LAZY_MODE_OFF;
++            }
++            if (params.split_mode == LLAMA_SPLIT_MODE_LAYER) {
++                params.split_mode = LLAMA_SPLIT_MODE_NONE;
++            }
++            if (params.tensor_buft_overrides != nullptr && params.tensor_buft_overrides[0].pattern == nullptr) {
++                params.tensor_buft_overrides = nullptr;
++            }
++            if (params.load_mode != LLAMA_LOAD_MODE_NONE || params.split_mode != LLAMA_SPLIT_MODE_NONE ||
++                params.lazy_mode != LLAMA_LAZY_MODE_OFF || params.check_tensors || params.no_alloc ||
++                params.vocab_only || params.load_mtp || params.use_extra_bufts || params.no_host ||
++                params.tensor_buft_overrides != nullptr) {
++                throw std::runtime_error("MoE expert paging requires load_mode=none, split_mode=none, lazy_mode=off, and default allocation, host, tensor-check, MTP, and tensor-override settings");
++            }
++        }
++
+         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
+-            params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
++            params.check_tensors, params.no_alloc, params.load_mtp, params.use_moe_expert_paging,
++            params.kv_overrides, params.tensor_buft_overrides);
+ 
+         ml.lazy.mode = params.lazy_mode;
+ 
+diff --git a/tests/test-moe-paged-loader.cpp b/tests/test-moe-paged-loader.cpp
+new file mode 100644
+index 0000000..ab5d1a4
+--- /dev/null
++++ b/tests/test-moe-paged-loader.cpp
+@@ -0,0 +1,303 @@
++#include "../src/llama-model-loader.h"
++#include "../src/llama-model.h"
++
++#include "gguf.h"
++#include "llama.h"
++
++#include <algorithm>
++#include <array>
++#include <cerrno>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fcntl.h>
++#include <stdexcept>
++#include <string>
++#include <unistd.h>
++#include <utility>
++#include <vector>
++
++static void require(bool condition, const char * message) {
++    if (!condition) {
++        throw std::runtime_error(message);
++    }
++}
++
++struct temp_file {
++    std::string path;
++
++    temp_file() {
++        std::array<char, 64> name{};
++        std::strcpy(name.data(), "/tmp/llama-moe-paged-XXXXXX");
++        const int fd = mkstemp(name.data());
++        if (fd < 0) {
++            throw std::runtime_error("mkstemp failed");
++        }
++        close(fd);
++        path = name.data();
++    }
++
++    temp_file(const temp_file &) = delete;
++    temp_file & operator=(const temp_file &) = delete;
++
++    temp_file(temp_file && other) noexcept : path(std::move(other.path)) {
++        other.path.clear();
++    }
++
++    ~temp_file() {
++        if (!path.empty()) {
++            unlink(path.c_str());
++        }
++    }
++};
++
++static void add_tensor(gguf_context * gguf, ggml_tensor * tensor) {
++    gguf_add_tensor(gguf, tensor);
++    gguf_set_tensor_data(gguf, tensor->name, tensor->data);
++}
++
++static temp_file make_fixture(const char * architecture, bool split) {
++    temp_file file;
++
++    ggml_init_params init{};
++    init.mem_size = 1 << 20;
++    ggml_context * tensors = ggml_init(init);
++    require(tensors != nullptr, "ggml_init failed");
++
++    auto * gate = ggml_new_tensor_3d(tensors, GGML_TYPE_F32, 4, 4, 2);
++    auto * up   = ggml_new_tensor_3d(tensors, GGML_TYPE_F32, 4, 4, 2);
++    auto * down = ggml_new_tensor_3d(tensors, GGML_TYPE_F32, 4, 4, 2);
++    auto * norm = ggml_new_tensor_1d(tensors, GGML_TYPE_F32, 4);
++    require(gate && up && down && norm, "synthetic tensors allocation failed");
++
++    ggml_set_name(gate, "blk.0.ffn_gate_exps.weight");
++    ggml_set_name(up,   "blk.0.ffn_up_exps.weight");
++    ggml_set_name(down, "blk.0.ffn_down_exps.weight");
++    ggml_set_name(norm, "blk.0.attn_norm.weight");
++    std::memset(gate->data, 0x11, ggml_nbytes(gate));
++    std::memset(up->data,   0x22, ggml_nbytes(up));
++    std::memset(down->data, 0x33, ggml_nbytes(down));
++    std::memset(norm->data, 0x44, ggml_nbytes(norm));
++
++    gguf_context * gguf = gguf_init_empty();
++    require(gguf != nullptr, "gguf_init_empty failed");
++    gguf_set_val_str(gguf, "general.architecture", architecture);
++    if (split) {
++        gguf_set_val_u16(gguf, "split.count", 2);
++    }
++    add_tensor(gguf, gate);
++    add_tensor(gguf, up);
++    add_tensor(gguf, down);
++    add_tensor(gguf, norm);
++
++    const bool wrote = gguf_write_to_file(gguf, file.path.c_str(), false);
++    gguf_free(gguf);
++    ggml_free(tensors);
++    require(wrote, "writing synthetic GGUF failed");
++    return file;
++}
++
++static int open_fd_count() {
++    long limit = sysconf(_SC_OPEN_MAX);
++    if (limit <= 0) {
++        limit = 1024;
++    }
++    limit = std::min<long>(limit, 4096);
++    int count = 0;
++    for (int fd = 0; fd < limit; ++fd) {
++        if (fcntl(fd, F_GETFD) >= 0) {
++            ++count;
++        }
++    }
++    return count;
++}
++
++static void test_metadata_only_expert_plan() {
++    auto file = make_fixture("qwen3moe", false);
++    std::vector<std::string> splits;
++
++    auto * cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++    require(cpu != nullptr, "CPU backend not available");
++    const buft_list_t cpu_buft{{cpu, ggml_backend_dev_buffer_type(cpu)}};
++
++    {
++        llama_model_loader loader(nullptr, nullptr, nullptr, file.path, splits, nullptr,
++                LLAMA_LOAD_MODE_NONE, false, false, false, true, nullptr, nullptr);
++
++        llama_hparams hparams{};
++        hparams.n_expert = 2;
++        hparams.n_layer_all = 1;
++        const LLM_TN tn(LLM_ARCH_QWEN3MOE);
++
++        require(loader.create_tensor(hparams, &cpu_buft, &cpu_buft, &cpu_buft, &cpu_buft,
++                    tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", 0), {4, 4, 2}, 0) != nullptr,
++                "gate expert tensor metadata creation failed");
++        require(loader.create_tensor(hparams, &cpu_buft, &cpu_buft, &cpu_buft, &cpu_buft,
++                    tn(LLM_TENSOR_FFN_UP_EXPS, "weight", 0), {4, 4, 2}, 0) != nullptr,
++                "up expert tensor metadata creation failed");
++        require(loader.create_tensor(hparams, &cpu_buft, &cpu_buft, &cpu_buft, &cpu_buft,
++                    tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", 0), {4, 4, 2}, 0) != nullptr,
++                "down expert tensor metadata creation failed");
++        require(loader.create_tensor(hparams, &cpu_buft, &cpu_buft, &cpu_buft, &cpu_buft,
++                    tn(LLM_TENSOR_ATTN_NORM, "weight", 0), {4}, 0) != nullptr,
++                "dense tensor metadata creation failed");
++        loader.done_getting_tensors();
++
++        require(loader.paged_expert_descriptors.size() == 3, "expected three expert descriptors");
++        require(loader.paged_expert_tensor_ids.size() == 3, "expected three expert tensor IDs");
++
++        std::size_t paged_tensor_count = 0;
++        for (const auto & entry : loader.ctx_map) {
++            if (!entry.first.paged) {
++                continue;
++            }
++            for (ggml_tensor * tensor = ggml_get_first_tensor(entry.second.get()); tensor;
++                    tensor = ggml_get_next_tensor(entry.second.get(), tensor)) {
++                require(tensor->data == nullptr, "expert metadata unexpectedly owns a tensor-sized payload");
++                ++paged_tensor_count;
++            }
++        }
++        require(paged_tensor_count == 3, "all experts must occupy the paged context");
++
++        loader.init_mappings();
++        require(loader.mappings.empty(), "page mode must not mmap any model file");
++        require(loader.size_data == sizeof(float) * 4, "ordinary load byte budget must exclude all expert payloads");
++        require(loader.size_done == 0, "metadata planning must not account any expert payload as loaded");
++
++        auto opened = loader.open_paged_expert_source(1024);
++        require(opened.ok(), "opening the synthetic expert source failed");
++        require(opened.source->tensor_count() == 3, "source must retain only three expert descriptors");
++        require(loader.size_done == 0, "opening the source must not read expert payloads");
++    }
++}
++
++static void test_rejected_split_closes_file() {
++    auto file = make_fixture("qwen3moe", true);
++    std::vector<std::string> splits;
++    const int before = open_fd_count();
++    bool rejected = false;
++    try {
++        llama_model_loader loader(nullptr, nullptr, nullptr, file.path, splits, nullptr,
++                LLAMA_LOAD_MODE_NONE, false, false, false, true, nullptr, nullptr);
++    } catch (const std::exception & e) {
++        rejected = std::string(e.what()).find("split GGUF") != std::string::npos;
++    }
++    require(rejected, "split GGUF paging request must fail explicitly");
++    require(open_fd_count() == before, "failed split load leaked an open shard descriptor");
++}
++
++static void test_public_model_load_fails_closed() {
++    auto file = make_fixture("qwen3moe", false);
++    auto params = llama_model_default_params();
++    params.use_moe_expert_paging = true;
++    params.load_mode = LLAMA_LOAD_MODE_NONE;
++    params.split_mode = LLAMA_SPLIT_MODE_NONE;
++    params.lazy_mode = LLAMA_LAZY_MODE_OFF;
++    params.use_extra_bufts = false;
++    require(llama_model_load_from_file(file.path.c_str(), params) == nullptr,
++            "incomplete synthetic Qwen3MoE load must fail before returning a model");
++}
++
++static std::string find_fixture_path(const std::string & rel_path) {
++    const char * env_path = std::getenv("PS5LM_FIXTURE_PATH");
++    if (env_path && access(env_path, R_OK) == 0) {
++        return env_path;
++    }
++    const std::vector<std::string> prefixes = {
++        "",
++        "./",
++        "../",
++        "../../",
++        "../../../",
++        "../../../../",
++    };
++    for (const auto & p : prefixes) {
++        std::string cand = p + rel_path;
++        if (access(cand.c_str(), R_OK) == 0) {
++            return cand;
++        }
++    }
++    return "";
++}
++
++static void test_qwen3moe_tiny_fixture_loader() {
++    const std::string fixture_path = find_fixture_path("tests/fixtures/moe_paging/qwen3moe-tiny-f32.gguf");
++    if (fixture_path.empty()) {
++        std::fprintf(stderr, "warning: qwen3moe-tiny-f32.gguf fixture not found, skipping fixture loader test\n");
++        return;
++    }
++
++    auto params_res = llama_model_default_params();
++    params_res.use_moe_expert_paging = false;
++    params_res.use_extra_bufts = false;
++    llama_model * model_res = llama_model_load_from_file(fixture_path.c_str(), params_res);
++    require(model_res != nullptr, "resident tiny model load failed");
++
++    auto params_paged = llama_model_default_params();
++    params_paged.use_moe_expert_paging = true;
++    params_paged.use_extra_bufts = false;
++    llama_model * model_paged = llama_model_load_from_file(fixture_path.c_str(), params_paged);
++    require(model_paged != nullptr, "paged tiny model load failed");
++    require(model_paged->has_paged_experts, "has_paged_experts must be true");
++
++    const auto * source = model_paged->paged_expert_source();
++    require(source != nullptr, "paged_expert_source() must not be null");
++
++    const int n_layer = model_paged->hparams.n_layer();
++    const int n_expert = model_paged->hparams.n_expert;
++    require(n_layer > 0 && n_expert > 0, "invalid model dimensions");
++
++    for (int il = 0; il < n_layer; ++il) {
++        const auto & layer_res = model_res->layers[il];
++        const auto & layer_paged = model_paged->layers[il];
++
++        const std::pair<const ggml_tensor *, const ggml_tensor *> pairs[] = {
++            {layer_res.ffn_gate_exps, layer_paged.ffn_gate_exps},
++            {layer_res.ffn_up_exps,   layer_paged.ffn_up_exps},
++            {layer_res.ffn_down_exps, layer_paged.ffn_down_exps},
++        };
++
++        for (const auto & [t_res, t_paged] : pairs) {
++            require(t_res != nullptr, "resident expert tensor missing");
++            require(t_paged != nullptr, "paged expert tensor missing");
++            require(t_res->data != nullptr, "resident expert tensor must have data");
++            require(t_paged->data == nullptr, "paged expert tensor must NOT have resident data");
++            require(ggml_backend_buffer_get_size(t_paged->buffer) == 0, "paged expert tensor buffer size must be 0");
++
++            uint64_t tensor_id = 0;
++            require(model_paged->paged_expert_tensor_id(t_paged, &tensor_id), "paged_expert_tensor_id lookup failed");
++            require(tensor_id > 0, "tensor_id must be non-zero");
++
++            const size_t slice_bytes = static_cast<size_t>(t_paged->nb[2]);
++            std::vector<uint8_t> slice_buf(slice_bytes);
++
++            for (int e = 0; e < n_expert; ++e) {
++                const auto read_err = source->read_expert(tensor_id, e, slice_buf.data(), slice_bytes);
++                require(read_err.ok(), "read_expert failed");
++
++                const uint8_t * res_ptr = static_cast<const uint8_t *>(t_res->data) + e * t_res->nb[2];
++                require(std::memcmp(slice_buf.data(), res_ptr, slice_bytes) == 0, "paged expert slice byte mismatch");
++            }
++        }
++    }
++
++    llama_model_free(model_res);
++    llama_model_free(model_paged);
++}
++
++int main() {
++    try {
++        llama_backend_init();
++        test_metadata_only_expert_plan();
++        test_rejected_split_closes_file();
++        test_public_model_load_fails_closed();
++        test_qwen3moe_tiny_fixture_loader();
++        llama_backend_free();
++    } catch (const std::exception & e) {
++        std::fprintf(stderr, "test-moe-paged-loader: %s\n", e.what());
++        llama_backend_free();
++        return 1;
++    }
++    std::fprintf(stderr, "test-moe-paged-loader: passed\n");
++    return 0;
++}

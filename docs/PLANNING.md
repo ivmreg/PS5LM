@@ -34,6 +34,29 @@ and decision-model context caps still apply. KV precision describes only the
 key/value cache representation. It does not claim model-weight precision or
 guarantee better answers.
 
+## Paged MoE planning
+
+Resident planning runs first. If the model fits residently, enabling Paged MoE
+does not change its plan or launch arguments.
+
+Paged MoE uses the configured `moe_cache_mib` value as a fixed GPU cache
+budget. The planner charges the full requested amount alongside non-expert
+weights, staging space, KV memory, state and its reserve. It rejects a request
+below the model's minimum cache requirement. It does not reduce or increase a
+user's cache setting to make a plan fit, and passes the same value to
+`--moe-cache-mib`. It does not enumerate alternate cache budgets; this setting
+has no automatic mode.
+
+After the fixed cache budget is accounted for, Paged MoE uses the same profile
+ordering and context caps described above. `long_context` tries the largest
+eligible context first and falls back only when a candidate exceeds the
+available-memory estimate. `balanced` keeps its 16k context ceiling, while
+`kv_precision` tries higher-precision KV candidates first. The user context
+limit, model trained context, preset cap and forced KV type remain in effect.
+Thus a smaller context is selected only when required by the chosen profile or
+the memory estimate; the planner does not silently trade away configured cache
+capacity.
+
 ## When changes take effect
 
 The selected profile is persisted as `planning_profile` in

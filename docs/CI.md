@@ -5,12 +5,14 @@ on pull requests and pushes to `main` or `ci/**`. It uses ordinary Ubuntu hosted
 runners, a read-only token, no secrets, and no console connection. Superseded runs
 are cancelled. There are two independent jobs:
 
-- **Host checks** (5-minute limit): shell/Python syntax, synthetic GGUF planner
+- **Host checks** (20-minute limit): shell/Python syntax, synthetic GGUF planner
   regressions, market split-model checks with mocked HTTP and FTP stubs,
   settings persistence, dashboard host syntax, and the Python build-queue and streaming-benchmark
-  suites. The workflow initializes the pinned llama.cpp and UI submodules first;
-  the host test runner makes no external network requests. Benchmark and market
-  HTTP behavior uses local mocks only.
+  suites. It also builds and runs the pinned patch series' scheduler-copy,
+  paged-loader, paging-inference and slot-map tests against the CPU backend. The workflow
+  initializes the pinned llama.cpp and UI submodules first; the host test
+  runners make no external network requests. Benchmark and market HTTP behavior
+  uses local mocks only.
 - **Full PS5 title cross-build** (45-minute limit, two compiler jobs): bootstrap
   the public SDK, reproduce clean-room `libc.prx`, build patched RADV and the
   existing llama-server/native dashboard, package the title folder, and inspect
@@ -25,7 +27,12 @@ Normal `scripts/build-app.sh` builds keep the prebuilt browser UI enabled;
 
 ## Reproduce the checks
 
-Host checks need Bash, Python 3, a C99 compiler, and a C++17/C++20 compiler.
+The existing host regression suites need Bash, Python 3, a C99 compiler, and a
+C++17/C++20 compiler. The MoE engine CPU tests additionally need Git, tar, CMake
+3.14 or newer, a C and C++17 compiler (GCC or Clang), and the selected CMake
+generator's build tool (Make or Ninja). They require a POSIX host such as Linux,
+macOS, or Linux under WSL. No Vulkan SDK or GPU is needed.
+
 Initialize the pinned headers used by the market and settings tests, then run
 the regression script from the repository root:
 
@@ -35,6 +42,27 @@ for script in scripts/*.sh ps5/app/ps5cc ps5/app/ps5cxx; do bash -n "$script"; d
 PYTHONPYCACHEPREFIX=build/pycache python3 -m py_compile scripts/*.py
 bash scripts/test-host.sh
 ~~~
+
+The MoE engine runner uses the pinned llama.cpp submodule and the checked-in
+153 KiB synthetic Qwen3MoE fixture:
+
+~~~sh
+git submodule update --init --depth 1 -- third_party/llama.cpp
+BUILD_JOBS=2 bash scripts/test-moe-engine.sh
+~~~
+
+It verifies the submodule gitlink revision, archives that commit into a unique
+directory under `build/`, applies numbered patches 0001-0012 to that isolated
+source copy, configures CPU-only CMake targets, and builds/runs
+`test-backend-sched-copy-callback`, `test-moe-paged-loader`,
+`test-moe-paging-inference`, and `test-moe-cache-slot-map`. The initialized submodule's working tree is not
+patched or cleaned. The runner disables optional GPU backends, OpenMP, the
+server/tools, and the prebuilt browser UI; it invokes the four binaries
+directly, so the unrelated CTest entries that fetch models or vocabulary files
+are not run. No model weights or network downloads are needed. Successful runs
+remove their scratch directory; failures retain it for inspection. Set
+`PS5LM_MOE_ENGINE_KEEP_BUILD=1` to keep a successful build, or
+`PS5LM_MOE_ENGINE_TMPDIR` to place the scratch directory elsewhere.
 
 The runner stores compiled checks in build/host-tests, Python bytecode in
 build/pycache, and the mocked market queue in build/market-test-queue.json.

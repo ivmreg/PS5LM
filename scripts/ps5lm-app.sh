@@ -11,6 +11,9 @@
 #   scripts/ps5lm-app.sh press <button>      press a button (up, down, cross, l1, r1, ...)
 #   scripts/ps5lm-app.sh fetch <url>         probe: download over HTTPS (system TLS), see app.log
 #   scripts/ps5lm-app.sh bench-write         probe: write speed by method, see app.log
+#   scripts/ps5lm-app.sh bench-read <absolute-model-file-path>  opt-in bounded title read probe
+#   scripts/ps5lm-app.sh bench-read-result    fetch /data/PS5LM/storage-probe.json
+#   scripts/ps5lm-app.sh bench-read-cancel    cancel an active read probe
 #   scripts/ps5lm-app.sh search <words>      search Get models from the PC
 #
 # The app is never killed: it polls /data/PS5LM/quit and leaves through
@@ -64,6 +67,25 @@ request() {
     printf '%s\n' "${2:--}" | curl -sS -T - "$ftp/data/PS5LM/$1"
 }
 
+bench_read() {
+    local path=${1:?absolute model file path on the console}
+    [[ "$path" == /* ]] || { echo "ps5lm-app: bench-read requires an absolute console path" >&2; exit 2; }
+    [[ "$path" != *$'\n'* && "$path" != *$'\r'* ]] || {
+        echo "ps5lm-app: bench-read path must be one line" >&2; exit 2;
+    }
+    request bench-read "$path"
+    echo "ps5lm-app: read request sent; fetch it later with bench-read-result"
+}
+
+bench_read_result() {
+    curl -sSf "$ftp/data/PS5LM/storage-probe.json"
+}
+
+bench_read_cancel() {
+    request bench-read-cancel
+    echo "ps5lm-app: cancellation requested"
+}
+
 screenshot() {
     request screenshot
     for _ in $(seq 1 20); do
@@ -80,6 +102,9 @@ case ${1:-} in
     unload) request unload ;;
     fetch) request fetch "${2:?https URL}" ;;
     bench-write) request bench-write ;;
+    bench-read) bench_read "${2:?absolute model file path on the console}" ;;
+    bench-read-result) bench_read_result ;;
+    bench-read-cancel) bench_read_cancel ;;
     search) request search "${2:?search words}" ;;
     press) request press "${2:?up|down|left|right|cross|circle|triangle|square|l1|r1|l2|r2}" ;;
     screenshot) screenshot "${2:-}" ;;
@@ -87,5 +112,5 @@ case ${1:-} in
     deploy) deploy ;;
     launch) launch ;;
     cycle) close; deploy; launch ;;
-    *) echo "usage: $0 close|deploy|launch|cycle|screenshot|load|unload|press|fetch|bench-write|search" >&2; exit 2 ;;
+    *) echo "usage: $0 close|deploy|launch|cycle|screenshot|load|unload|press|fetch|bench-write|bench-read <absolute-model-file-path>|bench-read-result|bench-read-cancel|search" >&2; exit 2 ;;
 esac

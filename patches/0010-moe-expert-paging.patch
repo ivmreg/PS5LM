@@ -1,0 +1,4406 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 6bc4a84..9d48ecd 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -2786,6 +2786,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.moe_cache_size = (size_t) value*1024*1024;
+         }
+     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
++    add_opt(common_arg(
++        {"--paged-moe"},
++        "enable on-demand MoE expert paging from GGUF storage (requires positive --moe-cache-mib, forces -ub 1 -np 1)",
++        [](common_params & params) {
++            params.use_moe_expert_paging = true;
++            params.n_ubatch = 1;
++            params.n_parallel = 1;
++            params.fit_params = false;
++            params.no_extra_bufts = true;
++            params.load_mode = LLAMA_LOAD_MODE_NONE;
++            params.split_mode = LLAMA_SPLIT_MODE_NONE;
++            params.lazy_mode = LLAMA_LAZY_MODE_OFF;
++        }
++    ).set_env("LLAMA_ARG_PAGED_MOE"));
+     add_opt(common_arg(
+         {"-ncffn", "--n-cpu-ffn"}, "N",
+         "keep the dense FFN weights of the first N layers in the CPU\n"
+diff --git a/common/common.cpp b/common/common.cpp
+index d82a5ee..d29ec3c 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1261,7 +1261,7 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+     auto mparams = common_model_params_to_llama(params);
+     auto cparams = common_context_params_to_llama(params);
+ 
+-    if (params.fit_params) {
++    if (params.fit_params && !params.use_moe_expert_paging) {
+         COM_TRC("%s", "fitting params to device memory ...\n");
+         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
+ 
+@@ -1722,6 +1722,19 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+     mparams.progress_callback           = params.load_progress_callback;
+     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
+     mparams.no_alloc                    = params.no_alloc;
++    mparams.use_moe_expert_paging       = params.use_moe_expert_paging;
++    if (params.use_moe_expert_paging) {
++        if (mparams.load_mode == LLAMA_LOAD_MODE_AUTO) {
++            mparams.load_mode = LLAMA_LOAD_MODE_NONE;
++        }
++        if (mparams.lazy_mode == LLAMA_LAZY_MODE_AUTO) {
++            mparams.lazy_mode = LLAMA_LAZY_MODE_OFF;
++        }
++        if (mparams.split_mode == LLAMA_SPLIT_MODE_LAYER) {
++            mparams.split_mode = LLAMA_SPLIT_MODE_NONE;
++        }
++        mparams.use_extra_bufts = false;
++    }
+     mparams.load_mtp                    = params.load_mtp || std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+ 
+     return mparams;
+diff --git a/common/common.h b/common/common.h
+index b6bb185..e6b8f79 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -598,6 +598,7 @@ struct common_params {
+     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+ 
+     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
++    bool use_moe_expert_paging = false; // enable on-demand MoE expert paging from GGUF storage
+ 
+     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
+ 
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index 7a65d81..11029ce 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -326,6 +326,16 @@ extern "C" {
+     // `graph` is the compute graph of the split
+     typedef bool (*ggml_backend_sched_copy_callback)(ggml_backend_t backend, const struct ggml_tensor * src, struct ggml_tensor * dst, struct ggml_cgraph * graph, void * user_data);
+ 
++    enum ggml_backend_sched_copy_result {
++        GGML_BACKEND_SCHED_COPY_NOT_HANDLED = 0,
++        GGML_BACKEND_SCHED_COPY_HANDLED = 1,
++        GGML_BACKEND_SCHED_COPY_ERROR = 2,
++    };
++
++    // The v2 callback takes precedence over the legacy callback when set.
++    // NOT_HANDLED falls back to a full tensor copy; ERROR fails graph compute.
++    typedef enum ggml_backend_sched_copy_result (*ggml_backend_sched_copy_callback_v2)(ggml_backend_t backend, const struct ggml_tensor * src, struct ggml_tensor * dst, struct ggml_cgraph * graph, void * user_data);
++
+     // Callback when the buffers reserved for a graph are not sufficient and have to be reserved again
+     // it happens on the graph allocation path and costs a synchronization of the backends
+     // `sched` is the scheduler
+@@ -374,6 +384,7 @@ extern "C" {
+ 
+     // Set a callback to be called when the inputs weights of a split are being copied
+     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
++    GGML_API void                 ggml_backend_sched_set_copy_callback_v2(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback_v2 callback, void * user_data);
+ 
+     // Set a callback to be called when the compute buffers of a graph are being reallocated
+     GGML_API void                 ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data);
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index ffbcba3..051e06b 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -969,6 +969,9 @@ struct ggml_backend_sched {
+     ggml_backend_sched_copy_callback callback_copy;
+     void * callback_copy_user_data;
+ 
++    ggml_backend_sched_copy_callback_v2 callback_copy_v2;
++    void * callback_copy_v2_user_data;
++
+     ggml_backend_sched_realloc_callback callback_realloc;
+     void * callback_realloc_user_data;
+ 
+@@ -1471,7 +1474,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+ 
+             // check if we should start a new split based on the sources of the current node
+             bool need_new_split = false;
+-            if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
++            if (node_backend_id == cur_backend_id && (split->n_inputs > 0 || (node->op == GGML_OP_GET_ROWS && i > split->i_start))) {
+                 for (int j = 0; j < GGML_MAX_SRC; j++) {
+                     struct ggml_tensor * src = node->src[j];
+                     if (src == NULL) {
+@@ -1820,13 +1823,22 @@ static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t) {
+         ggml_backend_buffer_is_host(t->buffer);
+ }
+ 
+-static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input) {
++static enum ggml_status ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input) {
+     const int split_backend_id = split->backend_id;
+     ggml_backend_t split_backend = sched->backends[split_backend_id];
+     ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
+     struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+ 
+     if (input->flags & GGML_TENSOR_FLAG_INPUT) {
++        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
++            ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
++        } else {
++            ggml_backend_synchronize(split_backend);
++        }
++        ggml_backend_tensor_copy(input, input_cpy);
++        return GGML_STATUS_SUCCESS;
++    }
++    /*
+         // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+@@ -1837,6 +1849,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+         return;
+     }
+ 
++    */
+     // wait for the split backend to finish using the input before overwriting it
+     if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+         ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+@@ -1844,11 +1857,32 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+         ggml_backend_synchronize(split_backend);
+     }
+ 
+-    if (sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input) &&
+-        sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
++    if (ggml_backend_sched_is_host_weight(input)) {
++        if (sched->callback_copy_v2 != NULL) {
++            switch (sched->callback_copy_v2(split_backend, input, input_cpy, &split->graph, sched->callback_copy_v2_user_data)) {
++                case GGML_BACKEND_SCHED_COPY_NOT_HANDLED:
++                    break;
++                case GGML_BACKEND_SCHED_COPY_HANDLED:
++                    return GGML_STATUS_SUCCESS;
++                case GGML_BACKEND_SCHED_COPY_ERROR:
++                default:
++                    return GGML_STATUS_FAILED;
++            }
++        } else if (sched->callback_copy != NULL && sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
++            return GGML_STATUS_SUCCESS;
++        }
++    }
++    /*
++
++            return GGML_STATUS_SUCCESS;
++        }
++    }
++
++
+         return;
+     }
+ 
++    */
+     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
+     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
+     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+@@ -1860,6 +1894,21 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+         }
+         ggml_backend_tensor_copy(input, input_cpy);
+     }
++
++    return GGML_STATUS_SUCCESS;
++    /*
++    if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
++        ggml_backend_synchronize(input_backend);
++        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
++            ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
++        } else {
++            ggml_backend_synchronize(split_backend);
++        }
++        ggml_backend_tensor_copy(input, input_cpy);
++    }
++}
++
++    */
+ }
+ 
+ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+@@ -1887,12 +1936,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
+         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+             if (!ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
+-                ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
++                enum ggml_status ec = ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
++                if (ec != GGML_STATUS_SUCCESS) {
++                    ggml_backend_sched_synchronize(sched);
++                    return ec;
++                }
+             }
+         }
+         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+             if (ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
+-                ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
++                enum ggml_status ec = ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
++                if (ec != GGML_STATUS_SUCCESS) {
++                    ggml_backend_sched_synchronize(sched);
++                    return ec;
++                }
+             }
+         }
+ 
+@@ -2155,6 +2212,12 @@ void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backe
+     sched->callback_copy_user_data = user_data;
+ }
+ 
++void ggml_backend_sched_set_copy_callback_v2(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback_v2 callback, void * user_data) {
++    GGML_ASSERT(sched);
++    sched->callback_copy_v2 = callback;
++    sched->callback_copy_v2_user_data = user_data;
++}
++
+ void ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data) {
+     GGML_ASSERT(sched);
+     sched->callback_realloc = callback;
+diff --git a/include/llama.h b/include/llama.h
+index f15ca9f..5cdd6c6 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -354,6 +354,7 @@ extern "C" {
+         bool no_host;         // bypass host buffer allowing extra buffers to be used
+         bool no_alloc;        // only load metadata and simulate memory allocations
+         bool load_mtp;        // whether to load MTP layers
++        bool use_moe_expert_paging; // experimental: retain Qwen3MoE expert descriptors without loading expert data
+     };
+ 
+     struct llama_sampler_seq_config {
+@@ -1131,6 +1132,9 @@ extern "C" {
+     // and is not necessary to call it explicitly in most cases
+     LLAMA_API void llama_synchronize(struct llama_context * ctx);
+ 
++    // Test fault injection for MoE cache/paging
++    LLAMA_API void llama_moe_set_fault_injection(struct llama_context * ctx, bool enable, int countdown);
++
+     // Token logits obtained from the last call to llama_decode()
+     // The logits for which llama_batch.logits[i] != 0 are stored contiguously
+     // in the order they have appeared in the batch.
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 97250c2..b56d217 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -44,6 +44,21 @@ set(LLAMA_CORE_SOURCES
+     unicode.cpp
+ )
+ 
++if (NOT WIN32)
++    list(APPEND LLAMA_CORE_SOURCES
++        expert_source.cpp
++        expert_source.hpp
++        slot_cache.cpp
++        slot_cache.hpp
++        paging_runtime.cpp
++        paging_runtime.hpp)
++    set_source_files_properties(
++        expert_source.cpp
++        slot_cache.cpp
++        paging_runtime.cpp
++        PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
++endif()
++
+ add_library(llama
+             ../include/llama.h
+             ${LLAMA_CORE_SOURCES}
+diff --git a/src/expert_source.cpp b/src/expert_source.cpp
+new file mode 100644
+index 0000000..e428aad
+--- /dev/null
++++ b/src/expert_source.cpp
+@@ -0,0 +1,394 @@
++#include "expert_source.hpp"
++
++#include <algorithm>
++#include <cerrno>
++#include <cstdio>
++#include <cstring>
++#include <limits>
++#include <new>
++#include <utility>
++
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <unistd.h>
++
++namespace ps5lm::moe {
++namespace {
++
++struct FileHandle {
++    int value = -1;
++
++    FileHandle() noexcept = default;
++    explicit FileHandle(int fd) noexcept : value(fd) {}
++    ~FileHandle() noexcept {
++        if (value >= 0) {
++            ::close(value);
++        }
++    }
++
++    FileHandle(const FileHandle &) = delete;
++    FileHandle & operator=(const FileHandle &) = delete;
++
++    FileHandle(FileHandle && other) noexcept : value(other.value) {
++        other.value = -1;
++    }
++
++    FileHandle & operator=(FileHandle && other) noexcept {
++        if (this != &other) {
++            if (value >= 0) {
++                ::close(value);
++            }
++            value = other.value;
++            other.value = -1;
++        }
++        return *this;
++    }
++};
++
++ReadError make_error(ReadStatus status, int system_error, const char * message) noexcept {
++    ReadError error;
++    error.status = status;
++    error.system_error = system_error;
++    std::snprintf(error.message, sizeof(error.message), "%s", message ? message : "error");
++    return error;
++}
++
++OpenResult open_failure(ReadStatus status, int system_error, const char * message) noexcept {
++    OpenResult result;
++    result.error = make_error(status, system_error, message);
++    return result;
++}
++
++bool checked_add(std::uint64_t a, std::uint64_t b, std::uint64_t & out) noexcept {
++    if (b > std::numeric_limits<std::uint64_t>::max() - a) {
++        return false;
++    }
++    out = a + b;
++    return true;
++}
++
++bool checked_mul(std::uint64_t a, std::uint64_t b, std::uint64_t & out) noexcept {
++    if (a != 0 && b > std::numeric_limits<std::uint64_t>::max() / a) {
++        return false;
++    }
++    out = a * b;
++    return true;
++}
++
++bool fits_off_t(std::uint64_t value) noexcept {
++    return value <= static_cast<std::uint64_t>(std::numeric_limits<off_t>::max());
++}
++
++bool identity_from_stat(const struct stat & st, FileIdentity & identity) noexcept {
++    identity.device = static_cast<std::uint64_t>(st.st_dev);
++    identity.inode = static_cast<std::uint64_t>(st.st_ino);
++    identity.available = st.st_ino != 0;
++    return identity.available;
++}
++
++bool same_identity(const FileIdentity & a, const FileIdentity & b) noexcept {
++    return a.available && b.available && a.device == b.device && a.inode == b.inode;
++}
++
++ReadError validate_current_file(
++        int fd,
++        const char * path,
++        std::uint64_t expected_size,
++        const FileIdentity & opened_identity) noexcept {
++    struct stat fd_stat{};
++    if (::fstat(fd, &fd_stat) != 0) {
++        return make_error(ReadStatus::IoError, errno, "fstat failed for expert shard");
++    }
++    if (fd_stat.st_size < 0 || static_cast<std::uint64_t>(fd_stat.st_size) != expected_size) {
++        return make_error(ReadStatus::FileChanged, 0, "expert shard size changed");
++    }
++
++    FileIdentity current_fd_identity;
++    if (identity_from_stat(fd_stat, current_fd_identity) && opened_identity.available &&
++            !same_identity(current_fd_identity, opened_identity)) {
++        return make_error(ReadStatus::FileChanged, 0, "open expert shard identity changed");
++    }
++
++    if (opened_identity.available) {
++        struct stat path_stat{};
++        if (::stat(path, &path_stat) != 0) {
++            return make_error(ReadStatus::FileChanged, errno, "expert shard path is no longer available");
++        }
++        FileIdentity current_path_identity;
++        if (!identity_from_stat(path_stat, current_path_identity) ||
++                !same_identity(current_path_identity, opened_identity)) {
++            return make_error(ReadStatus::FileChanged, 0, "expert shard path now names a different file");
++        }
++        if (path_stat.st_size < 0 || static_cast<std::uint64_t>(path_stat.st_size) != expected_size) {
++            return make_error(ReadStatus::FileChanged, 0, "expert shard path size changed");
++        }
++    }
++
++    return {};
++}
++
++}  // namespace
++
++struct ExpertSource::Shard {
++    std::string path;
++    std::uint64_t expected_size = 0;
++    FileIdentity expected_identity{};
++    FileIdentity opened_identity{};
++    FileHandle handle;
++};
++
++ExpertSource::ExpertSource() noexcept = default;
++ExpertSource::~ExpertSource() noexcept = default;
++
++OpenResult ExpertSource::open(
++        const std::vector<ShardPath> & shard_paths,
++        const std::vector<ExpertTensorDescriptor> & tensor_descriptors,
++        OpenOptions options) noexcept {
++    if (shard_paths.empty() || tensor_descriptors.empty() || options.max_expert_bytes == 0) {
++        return open_failure(ReadStatus::InvalidArgument, 0, "shards, tensor descriptors, and a nonzero byte cap are required");
++    }
++    if (shard_paths.size() > kMaxShards) {
++        return open_failure(ReadStatus::TooManyShards, 0, "shard count exceeds the source limit");
++    }
++    if (tensor_descriptors.size() > kMaxTensorDescriptors) {
++        return open_failure(ReadStatus::TooManyTensors, 0, "tensor descriptor count exceeds the source limit");
++    }
++
++    try {
++        auto source = std::unique_ptr<ExpertSource>(new ExpertSource());
++        source->max_expert_bytes_ = options.max_expert_bytes;
++        source->shards_.resize(shard_paths.size());
++        source->tensors_ = tensor_descriptors;
++
++        for (std::size_t i = 0; i < shard_paths.size(); ++i) {
++            if (shard_paths[i].path.empty() || shard_paths[i].path.size() > kMaxPathBytes ||
++                    shard_paths[i].path.find('\0') != std::string::npos) {
++                return open_failure(ReadStatus::InvalidArgument, 0, "shard path is empty or exceeds the path limit");
++            }
++            source->shards_[i].path = shard_paths[i].path;
++        }
++
++        std::vector<bool> shard_has_descriptor(shard_paths.size(), false);
++        for (const ExpertTensorDescriptor & tensor : source->tensors_) {
++            if (tensor.shard_index >= source->shards_.size() || tensor.tensor_bytes == 0 ||
++                    tensor.expert_count == 0 || tensor.expert_stride_bytes == 0 ||
++                    tensor.expected_file_size == 0) {
++                return open_failure(ReadStatus::InvalidDescriptor, 0, "expert tensor descriptor has a zero or invalid field");
++            }
++
++            if (tensor.expert_stride_bytes > options.max_expert_bytes ||
++                    tensor.expert_stride_bytes > std::numeric_limits<std::size_t>::max()) {
++                return open_failure(ReadStatus::BufferLimitExceeded, 0, "expert slice exceeds the configured staging cap");
++            }
++
++            std::uint64_t expected_tensor_bytes = 0;
++            std::uint64_t tensor_end = 0;
++            if (!checked_mul(tensor.expert_count, tensor.expert_stride_bytes, expected_tensor_bytes) ||
++                    expected_tensor_bytes != tensor.tensor_bytes ||
++                    !checked_add(tensor.absolute_offset, tensor.tensor_bytes, tensor_end) ||
++                    tensor_end > tensor.expected_file_size ||
++                    !fits_off_t(tensor.absolute_offset) || !fits_off_t(tensor_end) ||
++                    !fits_off_t(tensor.expected_file_size)) {
++                return open_failure(ReadStatus::InvalidDescriptor, 0, "expert tensor range or expert stride is invalid");
++            }
++
++            Shard & shard = source->shards_[tensor.shard_index];
++            if (!shard_has_descriptor[tensor.shard_index]) {
++                shard.expected_size = tensor.expected_file_size;
++                shard.expected_identity = tensor.expected_identity;
++                shard_has_descriptor[tensor.shard_index] = true;
++            } else if (shard.expected_size != tensor.expected_file_size ||
++                    shard.expected_identity.available != tensor.expected_identity.available ||
++                    (shard.expected_identity.available &&
++                     (shard.expected_identity.device != tensor.expected_identity.device ||
++                      shard.expected_identity.inode != tensor.expected_identity.inode))) {
++                return open_failure(ReadStatus::InvalidDescriptor, 0, "descriptors disagree about their shard identity or size");
++            }
++        }
++
++        if (std::find(shard_has_descriptor.begin(), shard_has_descriptor.end(), false) != shard_has_descriptor.end()) {
++            return open_failure(ReadStatus::InvalidDescriptor, 0, "every shard path must have a tensor descriptor");
++        }
++
++        std::sort(source->tensors_.begin(), source->tensors_.end(), [](const auto & a, const auto & b) {
++            return a.tensor_id < b.tensor_id;
++        });
++        for (std::size_t i = 1; i < source->tensors_.size(); ++i) {
++            if (source->tensors_[i - 1].tensor_id == source->tensors_[i].tensor_id) {
++                return open_failure(ReadStatus::InvalidDescriptor, 0, "tensor identifiers must be unique");
++            }
++        }
++
++#ifdef PS5LM_MOE_EXPERT_SOURCE_TESTING
++        source->pread_for_test_ = options.pread_for_test;
++        source->pread_user_data_ = options.pread_user_data;
++#endif
++
++        for (Shard & shard : source->shards_) {
++            // Avoid blocking on a FIFO before fstat can reject it. O_NONBLOCK
++            // has no effect on regular-file reads.
++            const int fd = ::open(shard.path.c_str(), O_RDONLY | O_NONBLOCK);
++            if (fd < 0) {
++                return open_failure(ReadStatus::FileOpenFailed, errno, "could not open expert shard read-only");
++            }
++            shard.handle = FileHandle(fd);
++
++            struct stat fd_stat{};
++            if (::fstat(fd, &fd_stat) != 0) {
++                return open_failure(ReadStatus::IoError, errno, "fstat failed while opening expert shard");
++            }
++            if (!S_ISREG(fd_stat.st_mode)) {
++                return open_failure(ReadStatus::InvalidDescriptor, 0, "expert shard is not a regular file");
++            }
++            if (fd_stat.st_size < 0 || static_cast<std::uint64_t>(fd_stat.st_size) != shard.expected_size) {
++                return open_failure(ReadStatus::FileChanged, 0, "expert shard length does not match its descriptor");
++            }
++            identity_from_stat(fd_stat, shard.opened_identity);
++            if (shard.expected_identity.available &&
++                    !same_identity(shard.expected_identity, shard.opened_identity)) {
++                return open_failure(ReadStatus::FileIdentityMismatch, 0, "expert shard identity does not match its descriptor");
++            }
++
++            struct stat path_stat{};
++            if (::stat(shard.path.c_str(), &path_stat) != 0) {
++                return open_failure(ReadStatus::IoError, errno, "stat failed while opening expert shard");
++            }
++            if (path_stat.st_size < 0 || static_cast<std::uint64_t>(path_stat.st_size) != shard.expected_size) {
++                return open_failure(ReadStatus::FileChanged, 0, "expert shard path length does not match its descriptor");
++            }
++            FileIdentity path_identity;
++            if (identity_from_stat(path_stat, path_identity) && shard.opened_identity.available &&
++                    !same_identity(path_identity, shard.opened_identity)) {
++                return open_failure(ReadStatus::FileIdentityMismatch, 0, "expert shard path changed during open");
++            }
++        }
++
++        OpenResult result;
++        result.source = std::move(source);
++        return result;
++    } catch (const std::bad_alloc &) {
++        return open_failure(ReadStatus::OutOfMemory, 0, "could not allocate bounded expert source metadata");
++    } catch (...) {
++        return open_failure(ReadStatus::InvalidArgument, 0, "unexpected error while opening expert source");
++    }
++}
++
++ReadError ExpertSource::read_expert(
++        std::uint64_t tensor_id,
++        std::uint64_t expert_id,
++        void * destination,
++        std::size_t destination_capacity,
++        const std::atomic_bool * cancelled) const noexcept {
++    if (destination == nullptr) {
++        return make_error(ReadStatus::InvalidArgument, 0, "destination buffer is null");
++    }
++    if (cancelled && cancelled->load(std::memory_order_relaxed)) {
++        return make_error(ReadStatus::Cancelled, 0, "expert read was cancelled");
++    }
++
++    const auto it = std::lower_bound(tensors_.begin(), tensors_.end(), tensor_id,
++            [](const ExpertTensorDescriptor & tensor, std::uint64_t id) {
++                return tensor.tensor_id < id;
++            });
++    if (it == tensors_.end() || it->tensor_id != tensor_id) {
++        return make_error(ReadStatus::TensorNotFound, 0, "expert tensor identifier was not found");
++    }
++    if (expert_id >= it->expert_count) {
++        return make_error(ReadStatus::ExpertOutOfRange, 0, "expert index is outside the tensor");
++    }
++    if (it->expert_stride_bytes > max_expert_bytes_ ||
++            it->expert_stride_bytes > std::numeric_limits<std::size_t>::max()) {
++        return make_error(ReadStatus::BufferLimitExceeded, 0, "expert slice exceeds the configured staging cap");
++    }
++    const std::size_t bytes = static_cast<std::size_t>(it->expert_stride_bytes);
++    if (destination_capacity < bytes) {
++        return make_error(ReadStatus::BufferTooSmall, 0, "destination buffer is smaller than one expert slice");
++    }
++
++    std::uint64_t expert_offset = 0;
++    std::uint64_t read_offset = 0;
++    std::uint64_t tensor_end = 0;
++    if (!checked_mul(expert_id, it->expert_stride_bytes, expert_offset) ||
++            !checked_add(it->absolute_offset, expert_offset, read_offset) ||
++            !checked_add(it->absolute_offset, it->tensor_bytes, tensor_end) ||
++            expert_offset > it->tensor_bytes || it->expert_stride_bytes > it->tensor_bytes - expert_offset ||
++            !fits_off_t(read_offset) || !fits_off_t(tensor_end)) {
++        return make_error(ReadStatus::InvalidDescriptor, 0, "expert read offset overflowed its tensor range");
++    }
++
++    const Shard & shard = shards_[it->shard_index];
++    ReadError file_status = validate_current_file(shard.handle.value, shard.path.c_str(), shard.expected_size, shard.opened_identity);
++    if (!file_status.ok()) {
++        return file_status;
++    }
++
++    std::size_t complete = 0;
++    while (complete < bytes) {
++        if (cancelled && cancelled->load(std::memory_order_relaxed)) {
++            return make_error(ReadStatus::Cancelled, 0, "expert read was cancelled");
++        }
++
++        const std::size_t remaining = bytes - complete;
++        const std::size_t request = std::min<std::size_t>(remaining,
++                static_cast<std::size_t>(std::numeric_limits<ssize_t>::max()));
++        std::uint64_t current_offset = 0;
++        if (!checked_add(read_offset, complete, current_offset) || !fits_off_t(current_offset)) {
++            return make_error(ReadStatus::InvalidDescriptor, 0, "expert read offset does not fit off_t");
++        }
++
++        ssize_t count;
++#ifdef PS5LM_MOE_EXPERT_SOURCE_TESTING
++        if (pread_for_test_) {
++            count = pread_for_test_(shard.handle.value,
++                    static_cast<std::uint8_t *>(destination) + complete,
++                    request, static_cast<off_t>(current_offset), pread_user_data_);
++        } else
++#endif
++        {
++            count = ::pread(shard.handle.value,
++                    static_cast<std::uint8_t *>(destination) + complete,
++                    request, static_cast<off_t>(current_offset));
++        }
++
++        if (count < 0) {
++            if (errno == EINTR) {
++                continue;
++            }
++            return make_error(ReadStatus::IoError, errno, "pread failed for expert slice");
++        }
++        if (count == 0) {
++            return make_error(ReadStatus::ShortRead, 0, "pread reached end of shard before the expert slice was complete");
++        }
++        if (static_cast<std::size_t>(count) > request) {
++            return make_error(ReadStatus::IoError, 0, "pread returned more bytes than requested");
++        }
++        complete += static_cast<std::size_t>(count);
++    }
++
++    return {};
++}
++
++const char * read_status_name(ReadStatus status) noexcept {
++    switch (status) {
++        case ReadStatus::Ok: return "ok";
++        case ReadStatus::InvalidArgument: return "invalid_argument";
++        case ReadStatus::InvalidDescriptor: return "invalid_descriptor";
++        case ReadStatus::TooManyShards: return "too_many_shards";
++        case ReadStatus::TooManyTensors: return "too_many_tensors";
++        case ReadStatus::FileOpenFailed: return "file_open_failed";
++        case ReadStatus::FileIdentityMismatch: return "file_identity_mismatch";
++        case ReadStatus::FileChanged: return "file_changed";
++        case ReadStatus::TensorNotFound: return "tensor_not_found";
++        case ReadStatus::ExpertOutOfRange: return "expert_out_of_range";
++        case ReadStatus::BufferTooSmall: return "buffer_too_small";
++        case ReadStatus::BufferLimitExceeded: return "buffer_limit_exceeded";
++        case ReadStatus::Cancelled: return "cancelled";
++        case ReadStatus::ShortRead: return "short_read";
++        case ReadStatus::IoError: return "io_error";
++        case ReadStatus::OutOfMemory: return "out_of_memory";
++    }
++    return "unknown";
++}
++
++}  // namespace ps5lm::moe
+diff --git a/src/expert_source.hpp b/src/expert_source.hpp
+new file mode 100644
+index 0000000..67ce30a
+--- /dev/null
++++ b/src/expert_source.hpp
+@@ -0,0 +1,136 @@
++#pragma once
++
++#include <atomic>
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++#include <string>
++#include <vector>
++
++#ifdef PS5LM_MOE_EXPERT_SOURCE_TESTING
++#include <sys/types.h>
++#endif
++
++namespace ps5lm::moe {
++
++enum class ReadStatus : std::uint8_t {
++    Ok,
++    InvalidArgument,
++    InvalidDescriptor,
++    TooManyShards,
++    TooManyTensors,
++    FileOpenFailed,
++    FileIdentityMismatch,
++    FileChanged,
++    TensorNotFound,
++    ExpertOutOfRange,
++    BufferTooSmall,
++    BufferLimitExceeded,
++    Cancelled,
++    ShortRead,
++    IoError,
++    OutOfMemory,
++};
++
++struct ReadError {
++    ReadStatus status = ReadStatus::Ok;
++    int system_error = 0;
++    char message[160]{};
++
++    bool ok() const noexcept { return status == ReadStatus::Ok; }
++};
++
++// POSIX device/inode identity. Set available only when the producer could read
++// both values from the source file during metadata validation.
++struct FileIdentity {
++    bool available = false;
++    std::uint64_t device = 0;
++    std::uint64_t inode = 0;
++};
++
++struct ShardPath {
++    std::string path;
++};
++
++// Descriptors must come from validated GGUF metadata. Every descriptor for the
++// same shard must carry the same expected size and identity.
++struct ExpertTensorDescriptor {
++    std::uint64_t tensor_id = 0;
++    std::uint32_t shard_index = 0;
++    std::uint64_t absolute_offset = 0;
++    std::uint64_t tensor_bytes = 0;
++    std::uint64_t expert_count = 0;
++    std::uint64_t expert_stride_bytes = 0;
++    std::uint64_t expected_file_size = 0;
++    FileIdentity expected_identity{};
++};
++
++struct OpenOptions {
++    // Hard upper bound on one expert slice passed to read_expert. This is a
++    // caller-owned staging limit; ExpertSource does not allocate that buffer.
++    std::size_t max_expert_bytes = 0;
++
++#ifdef PS5LM_MOE_EXPERT_SOURCE_TESTING
++    // Fault-injection seam for deterministic short-read and EINTR tests.
++    using PreadFunction = ssize_t (*)(int, void *, std::size_t, off_t, void *);
++    PreadFunction pread_for_test = nullptr;
++    void * pread_user_data = nullptr;
++#endif
++};
++
++struct OpenResult;
++
++class ExpertSource final {
++public:
++    static constexpr std::size_t kMaxShards = 64;
++    static constexpr std::size_t kMaxTensorDescriptors = 4096;
++    static constexpr std::size_t kMaxPathBytes = 4096;
++
++    ~ExpertSource() noexcept;
++    ExpertSource(const ExpertSource &) = delete;
++    ExpertSource & operator=(const ExpertSource &) = delete;
++
++    // Opens each shard read-only and validates its current identity and exact
++    // length before retaining the handle. No model/expert payload is allocated.
++    static OpenResult open(
++            const std::vector<ShardPath> & shards,
++            const std::vector<ExpertTensorDescriptor> & tensors,
++            OpenOptions options) noexcept;
++
++    // Reads exactly one quantized expert slice into caller-owned storage. On
++    // any failure, the destination may contain partial bytes and must be
++    // treated as invalid. Cancellation is checked between pread calls.
++    ReadError read_expert(
++            std::uint64_t tensor_id,
++            std::uint64_t expert_id,
++            void * destination,
++            std::size_t destination_capacity,
++            const std::atomic_bool * cancelled = nullptr) const noexcept;
++
++    std::size_t max_expert_bytes() const noexcept { return max_expert_bytes_; }
++    std::size_t tensor_count() const noexcept { return tensors_.size(); }
++
++private:
++    struct Shard;
++
++    ExpertSource() noexcept;
++
++    std::vector<Shard> shards_;
++    std::vector<ExpertTensorDescriptor> tensors_;
++    std::size_t max_expert_bytes_ = 0;
++#ifdef PS5LM_MOE_EXPERT_SOURCE_TESTING
++    OpenOptions::PreadFunction pread_for_test_ = nullptr;
++    void * pread_user_data_ = nullptr;
++#endif
++};
++
++struct OpenResult {
++    std::unique_ptr<ExpertSource> source;
++    ReadError error;
++
++    bool ok() const noexcept { return source != nullptr && error.ok(); }
++};
++
++const char * read_status_name(ReadStatus status) noexcept;
++
++}  // namespace ps5lm::moe
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 9ee64b5..a7f2cc0 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-context.h"
++#include "../ggml/src/ggml-backend-impl.h"
+ 
+ #include "ggml.h"
+ #include "llama-arch.h"
+@@ -178,6 +179,10 @@ llama_context::llama_context(
+     //     may need to be backend-dependent
+     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
+ 
++    if (model.has_paged_experts) {
++        cparams.moe_paged = true;
++    }
++
+     t_start_us = model.t_start_us;
+     t_load_us  = model.t_load_us;
+ 
+@@ -360,6 +365,26 @@ llama_context::llama_context(
+     cparams.kv_unified     = params.kv_unified;
+     cparams.moe_cache_size = params.moe_cache_size;
+ 
++    if (model.has_paged_experts) {
++        cparams.moe_paged = true;
++        if (params.n_ubatch > 1) {
++            throw std::runtime_error("paged MoE requires n_ubatch <= 1");
++        }
++        if (params.n_seq_max > 1) {
++            throw std::runtime_error("paged MoE requires n_seq_max <= 1");
++        }
++        if (params.moe_cache_size == 0) {
++            throw std::runtime_error("paged MoE requires moe_cache_size > 0");
++        }
++        if (params.embeddings) {
++            throw std::runtime_error("paged MoE does not support embeddings mode");
++        }
++        if (!cparams.causal_attn) {
++            throw std::runtime_error("paged MoE requires causal attention");
++        }
++        cparams.n_ubatch = 1;
++    }
++
+     // initialized later
+     cparams.pipeline_parallel = false;
+     cparams.training = false;
+@@ -438,6 +463,24 @@ llama_context::llama_context(
+             }
+         }
+ 
++        if (model.has_paged_experts && model.devices.empty()) {
++            backend_paged_cpu.reset(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
++            if (backend_paged_cpu == nullptr) {
++                throw std::runtime_error("failed to initialize paged CPU backend");
++            }
++            dev_paged_cpu = std::make_unique<ggml_backend_device>(*backend_paged_cpu->device);
++            dev_paged_cpu->context = backend_paged_cpu->device;
++            dev_paged_cpu->iface.supports_buft = [](ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) -> bool {
++                if (buft && strcmp(ggml_backend_buft_name(buft), "SLOT_MAP_HOST") == 0) {
++                    return false;
++                }
++                ggml_backend_dev_t orig_dev = static_cast<ggml_backend_dev_t>(dev->context);
++                return orig_dev->iface.supports_buft(orig_dev, buft);
++            };
++            backend_paged_cpu->device = dev_paged_cpu.get();
++            backends.emplace_back(std::move(backend_paged_cpu));
++        }
++
+         // add CPU backend
+         backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+         if (backend_cpu == nullptr) {
+@@ -593,6 +636,10 @@ llama_context::~llama_context() {
+             }
+         }
+     }
++    if (dev_paged_cpu && dev_paged_cpu->context && !backends.empty() && backends[0]) {
++        backends[0]->device = static_cast<ggml_backend_dev_t>(dev_paged_cpu->context);
++        dev_paged_cpu->context = nullptr;
++    }
+     ggml_opt_free(opt_ctx);
+ }
+ 
+@@ -603,7 +650,7 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+             return;
+         }
+ 
+-        const uint32_t n_tokens_probe = probe.n_tokens_per_seq*n_seqs;
++        const uint32_t n_tokens_probe = cparams.moe_paged ? 1 : (probe.n_tokens_per_seq*n_seqs);
+ 
+         auto * gf = graph_reserve(n_tokens_probe, n_seqs, n_tokens_probe, mctx, true);
+         if (!gf) {
+@@ -624,6 +671,9 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+             // TODO: make this descriptor-specific; model.dev_layer() preserves the current behavior,
+             // but is still wrong for cases like --no-kv-offload.
+             ggml_backend_dev_t device_layer = model.dev_layer(node.il);
++            if (device_fused && dev_paged_cpu && device_fused == dev_paged_cpu.get()) {
++                device_fused = static_cast<ggml_backend_dev_t>(dev_paged_cpu->context);
++            }
+ 
+             if (device_fused != device_layer) {
+                 LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but %s "
+@@ -708,7 +758,11 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
+     sched.reset(ggml_backend_sched_new(
+             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
+ 
+-    ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
++    if (cparams.moe_paged) {
++        ggml_backend_sched_set_copy_callback_v2(sched.get(), sched_copy_experts_v2, this);
++    } else {
++        ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
++    }
+     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
+ }
+ 
+@@ -875,6 +929,10 @@ void llama_context::synchronize() {
+ 
+     ggml_backend_sched_synchronize(sched.get());
+ 
++    if (moe_cache) {
++        moe_cache->complete_pending_paging();
++    }
++
+     // FIXME: if multiple single tokens are evaluated without a synchronization,
+     // the stats will be added to the prompt evaluation stats
+     // this should only happen when using batch size 1 to evaluate a batch
+@@ -1568,8 +1626,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+     }
+ 
+     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
++    if (cparams.moe_paged && sched) {
++        ggml_backend_sched_synchronize(sched.get());
++        if (moe_cache) {
++            moe_cache->complete_pending_paging();
++        }
++    }
+     if (status != GGML_STATUS_SUCCESS) {
+         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
++        if (moe_cache) {
++            moe_cache->complete_pending_paging();
++        }
+         ret = status;
+         return nullptr;
+     }
+@@ -2843,6 +2910,25 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+     return true;
+ }
+ 
++enum ggml_backend_sched_copy_result llama_context::sched_copy_experts_v2(
++        ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
++    auto * lctx = static_cast<llama_context *>(user_data);
++
++    if (lctx->moe_cache) {
++        auto res = lctx->moe_cache->copy_v2(backend, src, dst, graph);
++        if (res != GGML_BACKEND_SCHED_COPY_NOT_HANDLED) {
++            return res;
++        }
++    }
++
++    if (lctx->cparams.moe_paged) {
++        return GGML_BACKEND_SCHED_COPY_NOT_HANDLED;
++    }
++
++    bool ok = sched_copy_experts(backend, src, dst, graph, user_data);
++    return ok ? GGML_BACKEND_SCHED_COPY_HANDLED : GGML_BACKEND_SCHED_COPY_NOT_HANDLED;
++}
++
+ llm_graph_cb llama_context::graph_get_cb() const {
+     return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
+         if (il >= 0) {
+@@ -4211,6 +4297,16 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
+     ctx->set_warmup(warmup);
+ }
+ 
++llama_moe_cache * llama_context::get_moe_cache() const {
++    return moe_cache.get();
++}
++
++void llama_moe_set_fault_injection(llama_context * ctx, bool enable, int countdown) {
++    if (ctx && ctx->get_moe_cache()) {
++        ctx->get_moe_cache()->set_fault_injection(enable, countdown);
++    }
++}
++
+ void llama_synchronize(llama_context * ctx) {
+     ctx->synchronize();
+ }
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 6938fb1..6782598 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -75,6 +75,7 @@ struct llama_context {
+     uint32_t n_threads_batch() const;
+ 
+     llama_memory_t get_memory() const;
++    llama_moe_cache * get_moe_cache() const;
+ 
+     // return true if the memory was updated
+     bool memory_update(bool optimize);
+@@ -278,6 +279,7 @@ private:
+ 
+     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
+     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
++    static enum ggml_backend_sched_copy_result sched_copy_experts_v2(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
+ 
+     // ggml_backend_sched realloc callback, counts and traces the graph reallocations of this context
+     static void sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data);
+@@ -392,6 +394,8 @@ private:
+     int32_t n_reallocs_same = 0;
+     int32_t n_reallocs_diff = 0;
+ 
++    std::unique_ptr<struct ggml_backend_device> dev_paged_cpu;
++    ggml_backend_ptr backend_paged_cpu;
+     ggml_backend_t backend_cpu = nullptr;
+     std::vector<ggml_backend_ptr> backends;
+ 
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index f4eb181..4695063 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -56,6 +56,7 @@ struct llama_cparams {
+     bool training;           // set by llama_opt_init()
+ 
+     size_t moe_cache_size;
++    bool moe_paged = false;
+ 
+     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+ 
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index f69fe63..9de1ef9 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1536,7 +1536,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
+     n_embd_head_v    (hparams.n_embd_head_v()),
+     n_embd_v_gqa     (hparams.n_embd_v_gqa()),
+     n_expert         (hparams.n_expert),
+-    n_expert_used    (cparams.warmup ? hparams.n_expert : hparams.n_expert_used()),
++    n_expert_used    ((cparams.warmup && !cparams.moe_paged) ? hparams.n_expert : hparams.n_expert_used()),
+     freq_base        (cparams.rope_freq_base),
+     freq_scale       (cparams.rope_freq_scale),
+     ext_factor       (cparams.yarn_ext_factor),
+@@ -1659,6 +1659,9 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
+           ggml_tensor * w_s,
+           ggml_tensor * slots) const {
+     cur = build_hadamard_input(w, cur);
++    if (cparams.moe_paged && slots == nullptr) {
++        throw std::runtime_error("paged MoE requires cache slots; fallback to full expert tensor is forbidden");
++    }
+     // the experts in the MoE cache are selected by their slots
+     ggml_tensor * res = slots == nullptr ?
+         ggml_mul_mat_id(ctx0, w, cur, ids) :
+@@ -2497,19 +2500,42 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
+          ggml_tensor * gate_up_exps,
+                  int   il) const {
+     if (moe_cache == nullptr) {
++        if (cparams.moe_paged) {
++            throw std::runtime_error("paged MoE requires moe_cache");
++        }
+         return nullptr;
+     }
+ 
+     ggml_tensor * slot_map = moe_cache->get_slot_map(il, selected_experts->ne[1], selected_experts->ne[0]);
+     if (slot_map == nullptr) {
++        if (cparams.moe_paged) {
++            throw std::runtime_error(format("paged MoE layer %d slot_map is unavailable", il));
++        }
+         return nullptr;
+     }
+     for (ggml_tensor * w : { up_exps, gate_exps, down_exps, gate_up_exps }) {
+         if (w != nullptr && moe_cache->get_experts(w) == nullptr) {
++            if (cparams.moe_paged) {
++                throw std::runtime_error(format("paged MoE expert tensor %s lacks cache binding", w->name));
++            }
+             return nullptr;
+         }
+     }
++    /*
++        return nullptr;
++    }
+ 
++    ggml_tensor * slot_map = moe_cache->get_slot_map(il, selected_experts->ne[1], selected_experts->ne[0]);
++    if (slot_map == nullptr) {
++        return nullptr;
++    }
++    for (ggml_tensor * w : { up_exps, gate_exps, down_exps, gate_up_exps }) {
++        if (w != nullptr && moe_cache->get_experts(w) == nullptr) {
++            return nullptr;
++        }
++    }
++
++    */
+     ggml_tensor * ids = selected_experts;
+     if (!ggml_is_contiguous(ids)) {
+         ids = ggml_cont(ctx0, ids);
+@@ -2520,6 +2546,9 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
+     // the callback reads the selected experts, uploads the missing ones and updates the slot map
+     ggml_tensor * slots = ggml_get_rows(ctx0, slot_map, ids); // [1, n_expert_used*n_tokens]
+     if (!ggml_backend_supports_op(moe_cache->backend(il), slots)) {
++        if (cparams.moe_paged) {
++            throw std::runtime_error(format("target backend does not support GET_ROWS on slot_map for layer %d", il));
++        }
+         return nullptr;
+     }
+     ggml_backend_sched_set_tensor_backend(sched, slots, moe_cache->backend(il));
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index bc93c6f..0c28819 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -15,6 +15,10 @@
+ #include <regex>
+ #include <unordered_set>
+ 
++#if !defined(_WIN32)
++#include <sys/stat.h>
++#endif
++
+ static const size_t kiB = 1024;
+ static const size_t MiB = 1024*kiB;
+ static const size_t GiB = 1024*MiB;
+@@ -541,9 +545,16 @@ llama_model_loader::llama_model_loader(
+         bool check_tensors,
+         bool no_alloc,
+         bool load_mtp,
++        bool use_moe_expert_paging,
+         const llama_model_kv_override * param_overrides_p,
+         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
+         : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
++    this->use_moe_expert_paging = use_moe_expert_paging;
++
++    if (use_moe_expert_paging && fname.empty()) {
++        throw std::runtime_error("MoE expert paging requires a regular GGUF file path; file-pointer loading is unsupported");
++    }
++
+     int trace = 0;
+     if (getenv("LLAMA_TRACE")) {
+         trace = atoi(getenv("LLAMA_TRACE"));
+@@ -559,6 +570,12 @@ llama_model_loader::llama_model_loader(
+ 
+     this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK || load_mode == LLAMA_LOAD_MODE_AUTO;
+     this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
++    if (use_moe_expert_paging) {
++        // Page mode uses independent POSIX descriptors and must not touch the
++        // model's tensor payload through a whole-file mapping.
++        this->use_mmap = false;
++        this->use_direct_io = false;
++    }
+ 
+     if (!fname.empty()) {
+         // Load the main GGUF
+@@ -577,7 +594,12 @@ llama_model_loader::llama_model_loader(
+         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
+         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+ 
++        if (use_moe_expert_paging && llm_kv.arch != LLM_ARCH_QWEN3MOE) {
++            throw std::runtime_error("MoE expert paging currently supports only Qwen3MoE architecture");
++        }
++
+         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
++        file_paths.emplace_back(fname);
+         contexts.emplace_back(ctx);
+ 
+         // Save tensors data offset of the main file.
+@@ -596,6 +618,10 @@ llama_model_loader::llama_model_loader(
+         uint16_t n_split = 0;
+         get_key(llm_kv(LLM_KV_SPLIT_COUNT), n_split, false);
+ 
++        if (use_moe_expert_paging && n_split > 1) {
++            throw std::runtime_error("MoE expert paging does not support split GGUF models");
++        }
++
+         // Load additional GGML contexts
+         if (n_split > 1) {
+             // make sure the main file is loaded first
+@@ -646,6 +672,7 @@ llama_model_loader::llama_model_loader(
+                 }
+ 
+                 files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
++                file_paths.emplace_back(fname_split);
+                 contexts.emplace_back(ctx);
+ 
+                 // Save tensors data offset info of the shard.
+@@ -697,6 +724,7 @@ llama_model_loader::llama_model_loader(
+         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+ 
+         files.emplace_back(new llama_file(file));
++        file_paths.emplace_back();
+         contexts.emplace_back(ctx);
+ 
+         // Save tensors data offset info of the main file.
+@@ -715,6 +743,14 @@ llama_model_loader::llama_model_loader(
+         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+     }
+ 
++    if (use_moe_expert_paging) {
++        for (const auto & entry : weights_map) {
++            if (entry.first.find(".ffn_gate_up_exps.weight") != std::string::npos) {
++                throw std::runtime_error("MoE expert paging does not support merged gate/up expert tensors");
++            }
++        }
++    }
++
+     n_kv      = gguf_get_n_kv(metadata);
+     n_tensors = weights_map.size();
+ 
+@@ -1120,8 +1156,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+     // set below, before buft_for_tensor() runs
+     bool is_lazy = false;
+ 
++    bool is_paged = false;
++
+     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+-        const ctx_key key { buft, is_lazy };
++        const ctx_key key { buft, is_lazy, is_paged };
+ 
+         auto it = ctx_map.find(key);
+         if (it == ctx_map.end()) {
+@@ -1213,6 +1251,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+             return lazy_read::buft();
+         }
+ 
++        if (is_paged) {
++            auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++            if (!cpu_dev) {
++                throw std::runtime_error("MoE expert paging requires a CPU backend");
++            }
++            return ggml_backend_dev_buffer_type(cpu_dev);
++        }
++
+         // select the buffer type for this tensor
+         const buft_list_t * buft_list;
+         switch (info.layer) {
+@@ -1340,6 +1386,61 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         return NULL;
+     }
+ 
++    const std::string tensor_name = tn.str();
++    if (use_moe_expert_paging) {
++        const bool is_gate_up_down_expert =
++            tensor_name.size() > 0 &&
++            tensor_name.rfind(".weight") == tensor_name.size() - 7 &&
++            (tensor_name.find(".ffn_gate_exps.weight") != std::string::npos ||
++             tensor_name.find(".ffn_up_exps.weight")   != std::string::npos ||
++             tensor_name.find(".ffn_down_exps.weight") != std::string::npos);
++        if (is_gate_up_down_expert) {
++            if (ne.size() != 3 || ggml_n_dims(cur) != 3 || cur->ne[2] != hparams.n_expert || cur->ne[2] <= 0) {
++                throw std::runtime_error(format("unsupported Qwen3MoE expert tensor layout for %s", tensor_name.c_str()));
++            }
++            const uint64_t tensor_bytes = ggml_nbytes(cur);
++            const uint64_t expert_count = static_cast<uint64_t>(cur->ne[2]);
++            if (tensor_bytes == 0 || tensor_bytes % expert_count != 0 || cur->nb[2] != tensor_bytes / expert_count) {
++                throw std::runtime_error(format("non-contiguous Qwen3MoE expert tensor layout for %s", tensor_name.c_str()));
++            }
++
++            const auto & weight = require_weight(tensor_name.c_str());
++            if (weight.idx >= files.size() || weight.idx >= file_paths.size() || file_paths[weight.idx].empty()) {
++                throw std::runtime_error(format("expert tensor %s has no reopenable shard path", tensor_name.c_str()));
++            }
++            const uint64_t file_size = static_cast<uint64_t>(files[weight.idx]->size());
++            if (weight.offs > file_size || tensor_bytes > file_size - weight.offs) {
++                throw std::runtime_error(format("expert tensor %s lies outside its source shard", tensor_name.c_str()));
++            }
++
++            ps5lm::moe::FileIdentity identity{};
++#if !defined(_WIN32)
++            struct stat st;
++            if (stat(file_paths[weight.idx].c_str(), &st) != 0 || st.st_size < 0 || static_cast<uint64_t>(st.st_size) != file_size) {
++                throw std::runtime_error(format("unable to validate source shard identity for %s", tensor_name.c_str()));
++            }
++            identity.available = true;
++            identity.device = static_cast<uint64_t>(st.st_dev);
++            identity.inode = static_cast<uint64_t>(st.st_ino);
++#else
++            throw std::runtime_error("MoE expert paging requires POSIX file identity support");
++#endif
++            const uint64_t id = next_paged_expert_tensor_id++;
++            paged_expert_descriptors.push_back({
++                id,
++                weight.idx,
++                static_cast<uint64_t>(weight.offs),
++                tensor_bytes,
++                expert_count,
++                static_cast<uint64_t>(cur->nb[2]),
++                file_size,
++                identity,
++            });
++            paged_expert_tensor_ids.emplace(tensor_name, id);
++            is_paged = true;
++        }
++    }
++
+     if (flags & TENSOR_READ_LAZY) {
+         // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
+         is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
+@@ -1390,6 +1491,17 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+     return tensor;
+ }
+ 
++#if !defined(_WIN32)
++ps5lm::moe::OpenResult llama_model_loader::open_paged_expert_source(std::size_t max_expert_bytes) const {
++    std::vector<ps5lm::moe::ShardPath> paths;
++    paths.reserve(file_paths.size());
++    for (const auto & path : file_paths) {
++        paths.push_back({path});
++    }
++    return ps5lm::moe::ExpertSource::open(paths, paged_expert_descriptors, {max_expert_bytes});
++}
++#endif
++
+ void llama_model_loader::done_getting_tensors(bool partial) const {
+     if (n_created > n_tensors) {
+         throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_created));
+@@ -1443,6 +1555,9 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
+ 
+     // compute the total size of all tensors for progress reporting
+     for (const auto & it : weights_map) {
++        if (use_moe_expert_paging && paged_expert_tensor_ids.count(it.first) != 0) {
++            continue;
++        }
+         size_data += ggml_nbytes(it.second.tensor);
+     }
+ }
+diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
+index ed59079..0f0b85b 100644
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -6,6 +6,7 @@
+ #include "llama-arch.h"
+ #include "llama-hparams.h"
+ #include "llama-mmap.h"
++#include "expert_source.hpp"
+ 
+ #include "ggml-cpp.h"
+ 
+@@ -81,6 +82,14 @@ struct llama_model_loader {
+     bool check_tensors;
+     bool no_alloc;
+     bool load_mtp;
++    bool use_moe_expert_paging = false;
++
++    // Keep source paths parallel to files so expert descriptors can reopen a
++    // pinned read-only handle after the ordinary llama_file objects are gone.
++    std::vector<std::string> file_paths;
++    std::vector<ps5lm::moe::ExpertTensorDescriptor> paged_expert_descriptors;
++    std::unordered_map<std::string, uint64_t> paged_expert_tensor_ids;
++    uint64_t next_paged_expert_tensor_id = 1;
+ 
+     // handle TENSOR_READ_LAZY
+     // use case: keep PLE / engrams embd tensors on disk, read them on demand
+@@ -149,6 +158,7 @@ struct llama_model_loader {
+     struct ctx_key {
+         ggml_backend_buffer_type_t buft;
+         bool lazy;
++        bool paged;
+     };
+ 
+     struct ctx_key_comparator {
+@@ -156,6 +166,9 @@ struct llama_model_loader {
+             if (lhs.lazy != rhs.lazy) {
+                 return lhs.lazy < rhs.lazy;
+             }
++            if (lhs.paged != rhs.paged) {
++                return lhs.paged < rhs.paged;
++            }
+             return strcmp(ggml_backend_buft_name(lhs.buft), ggml_backend_buft_name(rhs.buft)) < 0;
+         }
+     };
+@@ -180,6 +193,7 @@ struct llama_model_loader {
+         bool check_tensors,
+         bool no_alloc,
+         bool load_mtp,
++        bool use_moe_expert_paging,
+         const llama_model_kv_override * param_overrides_p,
+         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
+ 
+@@ -238,6 +252,8 @@ struct llama_model_loader {
+ 
+     void done_getting_tensors(bool partial = false) const;
+ 
++    ps5lm::moe::OpenResult open_paged_expert_source(std::size_t max_expert_bytes) const;
++
+     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
+ 
+     // byte range within a mapped file
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index aeab7b7..1bfb12c 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1265,6 +1265,12 @@ struct llama_model::impl {
+     bool has_tensor_overrides;
+ 
+     std::vector<float> tensor_split_owned;
++
++#if !defined(_WIN32)
++    // Own the read-only source for as long as model tensor descriptors live.
++    std::unique_ptr<ps5lm::moe::ExpertSource> paged_expert_source;
++    std::unordered_map<const ggml_tensor *, uint64_t> paged_expert_tensor_ids;
++#endif
+ };
+ 
+ bool llama_prec_policy::apply(ggml_tensor * res) const {
+@@ -1849,6 +1855,25 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+ 
+     ml.done_getting_tensors();
+ 
++    if (ml.use_moe_expert_paging) {
++        if (ml.paged_expert_descriptors.size() != static_cast<std::size_t>(n_layer_all) * 3) {
++            throw std::runtime_error(format("Qwen3MoE paging expected %d layers with gate/up/down tensors, found %zu expert tensors",
++                n_layer_all, ml.paged_expert_descriptors.size()));
++        }
++#if !defined(_WIN32)
++        constexpr std::size_t max_expert_bytes = 64 * 1024 * 1024;
++        auto opened = ml.open_paged_expert_source(max_expert_bytes);
++        if (!opened.ok()) {
++            throw std::runtime_error(format("failed to open paged expert source (%s): %s",
++                ps5lm::moe::read_status_name(opened.error.status), opened.error.message));
++        }
++        pimpl->paged_expert_source = std::move(opened.source);
++        has_paged_experts = true;
++#else
++        throw std::runtime_error("MoE expert paging requires POSIX file descriptor support");
++#endif
++    }
++
+     if (per_layer_tok_embd && ml.lazy.has(per_layer_tok_embd)) {
+         LLAMA_LOG_INFO("%s: enabling prefetch for '%s'\n", __func__, per_layer_tok_embd->name);
+ 
+@@ -1865,6 +1890,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     for (auto & [_, ctx_ptr] : ml.ctx_map) {
+         for (auto * cur = ggml_get_first_tensor(ctx_ptr.get()); cur != NULL; cur = ggml_get_next_tensor(ctx_ptr.get(), cur)) {
+             tensors_by_name.emplace_back(ggml_get_name(cur), cur);
++#if !defined(_WIN32)
++            const auto paged_id = ml.paged_expert_tensor_ids.find(ggml_get_name(cur));
++            if (paged_id != ml.paged_expert_tensor_ids.end()) {
++                pimpl->paged_expert_tensor_ids.emplace(cur, paged_id->second);
++            }
++#endif
+         }
+     }
+ 
+@@ -1934,7 +1965,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+             }
+         } else {
+             ggml_backend_buffer_t buf;
+-            if (ml.no_alloc) {
++            if (ml.no_alloc || ctx_key.paged) {
+                 buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
+                 for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
+@@ -1967,7 +1998,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+ 
+         pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
+ 
+-        ctx_bufs.emplace_back(ctx, std::move(buf_ptrs));
++        if (!ctx_key.paged) {
++            ctx_bufs.emplace_back(ctx, std::move(buf_ptrs));
++        }
+     }
+ 
+     if (llama_supports_gpu_offload()) {
+@@ -2019,6 +2052,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         }
+     }
+ 
++#if !defined(_WIN32)
++    if (ml.use_moe_expert_paging && !ml.paged_expert_descriptors.empty()) {
++        size_t max_expert_bytes = 0;
++        for (const auto & desc : ml.paged_expert_descriptors) {
++            max_expert_bytes = std::max(max_expert_bytes, static_cast<size_t>(desc.expert_stride_bytes));
++        }
++        auto open_res = ml.open_paged_expert_source(max_expert_bytes);
++        if (!open_res.ok()) {
++            throw std::runtime_error(format("failed to open paged expert source: %s", open_res.error.message));
++        }
++        pimpl->paged_expert_source = std::move(open_res.source);
++        has_paged_experts = true;
++    }
++#endif
++
+     load_tensors_hadamard();
+ 
+     return true;
+@@ -2716,6 +2764,34 @@ bool llama_model::has_tensor_overrides() const {
+     return pimpl->has_tensor_overrides;
+ }
+ 
++const ps5lm::moe::ExpertSource * llama_model::paged_expert_source() const {
++#if !defined(_WIN32)
++    return pimpl->paged_expert_source.get();
++#else
++    return nullptr;
++#endif
++}
++
++bool llama_model::paged_expert_tensor_id(const struct ggml_tensor * tensor, uint64_t * id_out) const {
++#if !defined(_WIN32)
++    if (!tensor) {
++        return false;
++    }
++    auto it = pimpl->paged_expert_tensor_ids.find(tensor);
++    if (it == pimpl->paged_expert_tensor_ids.end()) {
++        return false;
++    }
++    if (id_out) {
++        *id_out = it->second;
++    }
++    return true;
++#else
++    GGML_UNUSED(tensor);
++    GGML_UNUSED(id_out);
++    return false;
++#endif
++}
++
+ const ggml_tensor * llama_model::get_tensor(const char * name) const {
+     auto it = std::find_if(tensors_by_name.begin(), tensors_by_name.end(),
+             [name](const std::pair<std::string, ggml_tensor *> & it) {
+@@ -3346,6 +3422,7 @@ llama_model_params llama_model_default_params() {
+         /*.no_host                     =*/ false,
+         /*.no_alloc                    =*/ false,
+         /*.load_mtp                    =*/ false,
++        /*.use_moe_expert_paging       =*/ false,
+     };
+ 
+     return result;
+diff --git a/src/llama-model.h b/src/llama-model.h
+index bc640e0..11932e8 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "llama.h"
++#include "expert_source.hpp"
+ #include "llama-arch.h"
+ #include "llama-graph.h"
+ #include "llama-hparams.h"
+@@ -693,6 +694,9 @@ struct llama_model {
+     // see llama_model_set_attn_rot
+     bool attn_rot = true;
+ 
++    // Page mode is metadata-only until the cache and graph callback are integrated.
++    bool has_paged_experts = false;
++
+     // for classifier models
+     std::vector<std::string> classifier_labels;
+ 
+@@ -831,6 +835,9 @@ struct llama_model {
+ 
+     const struct ggml_tensor * get_tensor(const char * name) const;
+ 
++    const ps5lm::moe::ExpertSource * paged_expert_source() const;
++    bool paged_expert_tensor_id(const struct ggml_tensor * tensor, uint64_t * id_out) const;
++
+     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
+     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;
+ 
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index f22d986..035aea0 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -4,14 +4,37 @@
+ #include "llama-model.h"
+ 
+ #include "ggml-cpp.h"
++#include "../ggml/src/ggml-backend-impl.h"
++
++#if !defined(_WIN32)
++#include "slot_cache.hpp"
++#include "paging_runtime.hpp"
++#endif
+ 
+ #include <algorithm>
++#include <cstdint>
++#include <cstring>
+ #include <stdexcept>
+ #include <unordered_map>
+ #include <vector>
+ 
+ namespace {
+ 
++static const char * buft_slot_map_get_name(ggml_backend_buffer_type_t) {
++    return "SLOT_MAP_HOST";
++}
++
++static ggml_backend_buffer_type make_buft_slot_map() {
++    ggml_backend_buffer_type buft = *ggml_backend_cpu_buffer_type();
++    buft.iface.get_name = buft_slot_map_get_name;
++    return buft;
++}
++
++static ggml_backend_buffer_type_t get_buft_slot_map() {
++    static ggml_backend_buffer_type buft = make_buft_slot_map();
++    return &buft;
++}
++
+ // LRU of the experts of a group of layers, the slot of each expert is kept in the slot map of its layer
+ struct moe_cache_lru {
+     int32_t n_expert = 0;
+@@ -148,7 +171,70 @@ static bool llama_moe_cache_is_host_weight(const ggml_tensor * t) {
+         ggml_backend_buffer_is_host(t->buffer);
+ }
+ 
+-}
++#if !defined(_WIN32)
++class MoeCacheUploadBackend : public ps5lm::moe::ExpertUploadBackend {
++public:
++    ggml_backend_t backend = nullptr;
++    std::vector<ggml_tensor *> banks;
++    bool fault_injection_enabled = false;
++    int fault_injection_countdown = 0;
++    ps5lm::moe::UploadToken next_upload_token = 0;
++
++    ps5lm::moe::UploadSubmission submit_upload(
++            ps5lm::moe::ExpertKey key,
++            ps5lm::moe::ExpertTensorRole role,
++            std::size_t slot,
++            const void * source_bytes,
++            std::size_t byte_count) noexcept override {
++        GGML_UNUSED(key);
++        if (fault_injection_enabled) {
++            if (fault_injection_countdown <= 0) {
++                return { false, 0 };
++            }
++            fault_injection_countdown--;
++        }
++
++        size_t bank_idx = 0;
++        if (banks.size() == 3) {
++            switch (role) {
++                case ps5lm::moe::ExpertTensorRole::Gate: bank_idx = 0; break;
++                case ps5lm::moe::ExpertTensorRole::Up:   bank_idx = 1; break;
++                case ps5lm::moe::ExpertTensorRole::Down: bank_idx = 2; break;
++            }
++        } else if (banks.size() == 2) {
++            switch (role) {
++                case ps5lm::moe::ExpertTensorRole::Gate:
++                case ps5lm::moe::ExpertTensorRole::Up:   bank_idx = 0; break;
++                case ps5lm::moe::ExpertTensorRole::Down: bank_idx = 1; break;
++            }
++        }
++        if (bank_idx >= banks.size()) {
++            return { false, 0 };
++        }
++        ggml_tensor * bank = banks[bank_idx];
++        const size_t expert_stride = bank->nb[2];
++        const size_t offset = slot * expert_stride;
++
++        ggml_backend_tensor_set_async(backend, bank, source_bytes, offset, byte_count);
++
++        next_upload_token++;
++        return { true, next_upload_token };
++    }
++
++    ps5lm::moe::TransferFenceStatus wait_transfer(ps5lm::moe::UploadToken token) noexcept override {
++        GGML_UNUSED(token);
++        ggml_backend_synchronize(backend);
++        return ps5lm::moe::TransferFenceStatus::Complete;
++    }
++
++    ps5lm::moe::TransferFenceStatus quiesce() noexcept override {
++        ggml_backend_synchronize(backend);
++        return ps5lm::moe::TransferFenceStatus::Complete;
++    }
++};
++#endif
++
++} // namespace
+ 
+ struct llama_moe_cache::impl {
+     // a GPU with its own budget and banks, it caches the layers assigned to it
+@@ -173,6 +259,14 @@ struct llama_moe_cache::impl {
+         size_t host_bytes = 0;
+         int32_t n_slots = 0;
+         moe_cache_lru lru;
++
++#if !defined(_WIN32)
++        std::unique_ptr<MoeCacheUploadBackend> upload_backend;
++        std::unique_ptr<ps5lm::moe::SlotCache> slot_cache;
++        std::unique_ptr<ps5lm::moe::PagingQuarantine> quarantine;
++        std::unique_ptr<ps5lm::moe::PagingRuntime> runtime;
++        std::vector<ps5lm::moe::CompletionToken> pending_completion_tokens;
++#endif
+     };
+ 
+     struct layer {
+@@ -196,6 +290,8 @@ struct llama_moe_cache::impl {
+     static constexpr int64_t max_batch = 32;
+ 
+     int32_t n_expert_used;
++    bool is_paged_mode = false;
++    uint64_t next_completion_token = 0;
+ 
+     stats stats_small; // up to 8 tokens per ubatch
+     stats stats_large;
+@@ -219,7 +315,7 @@ struct llama_moe_cache::impl {
+     ggml_context_ptr ctx_views;
+ 
+     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
+-            n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
++            n_expert_used(model.hparams.n_expert_used_max()), is_paged_mode(model.has_paged_experts), layers(model.layers.size()) {
+         for (size_t i = 0; i < backends.size(); ++i) {
+             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
+             if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+@@ -229,7 +325,13 @@ struct llama_moe_cache::impl {
+             }
+         }
+         if (devices.empty()) {
+-            throw std::runtime_error("MoE cache requires a GPU backend");
++            if (model.has_paged_experts && !backends.empty()) {
++                auto & d = devices.emplace_back();
++                d.backend = backends[0];
++                d.buft    = bufts[0];
++            } else {
++                throw std::runtime_error("MoE cache requires a GPU backend");
++            }
+         }
+         if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+             throw std::runtime_error("MoE cache does not support tensor parallelism");
+@@ -244,7 +346,10 @@ struct llama_moe_cache::impl {
+             if (experts.empty() || !std::all_of(experts.begin(), experts.end(), llama_moe_cache_is_host_weight)) {
+                 continue;
+             }
+-            const auto it_dev = std::find_if(devices.begin(), devices.end(), [&](const device & d) { return ggml_backend_get_device(d.backend) == model.dev_layer(il); });
++            const auto it_dev = std::find_if(devices.begin(), devices.end(), [&](const device & d) {
++                return ggml_backend_get_device(d.backend) == model.dev_layer(il) ||
++                       (model.has_paged_experts && model.devices.empty());
++            });
+             if (it_dev == devices.end()) {
+                 continue;
+             }
+@@ -307,6 +412,32 @@ struct llama_moe_cache::impl {
+             }
+         }
+ 
++        ggml_backend_buffer_type_t buft_host = is_paged_mode ? get_buft_slot_map() : ggml_backend_cpu_buffer_type();
++        const size_t alignment_host = ggml_backend_buft_get_alignment(buft_host);
++
++        if (is_paged_mode) {
++            size_t min_budget_floor = 0;
++            for (const group & g : groups) {
++                int32_t slots_min = 0;
++                for (int32_t il : g.layers) {
++                    slots_min = std::max<int32_t>(slots_min, std::min<int32_t>(model.hparams.n_expert_used(il), model.hparams.n_expert));
++                }
++                size_t staging_bytes = 0;
++                for (const ggml_tensor * t : g.ref) {
++                    staging_bytes = std::max<size_t>(staging_bytes, t->nb[2]);
++                }
++                size_t group_host_bytes = 0;
++                for (int32_t il : g.layers) {
++                    GGML_UNUSED(il);
++                    group_host_bytes += GGML_PAD(sizeof(int32_t) * g.ref[0]->ne[2], alignment_host);
++                }
++                min_budget_floor += alloc_size(g, slots_min) + staging_bytes + group_host_bytes;
++            }
++            if (size < min_budget_floor) {
++                throw std::runtime_error(format("MoE cache budget (%zu bytes) is below minimum budget floor (%zu bytes)", size, min_budget_floor));
++            }
++        }
++
+         // within a device the budget is split by the size of the experts, so each group caches the same fraction of its experts
+         std::vector<size_t> n_tensors(devices.size(), 0);
+         size_t n_tensors_host = 0;
+@@ -318,6 +449,9 @@ struct llama_moe_cache::impl {
+             while (g.n_slots < max_slots && alloc_size(g, g.n_slots + 1) <= budget) {
+                 g.n_slots++;
+             }
++            if (is_paged_mode && g.n_slots < n_expert_used) {
++                g.n_slots = n_expert_used;
++            }
+             if (g.n_slots < n_expert_used) {
+                 LLAMA_LOG_WARN("%s: MoE cache budget is too small for %zu layers, they are not cached\n", __func__, g.layers.size());
+                 g.n_slots = 0;
+@@ -351,9 +485,6 @@ struct llama_moe_cache::impl {
+         ctx_host  = init_ctx(n_tensors_host);
+         ctx_views = init_ctx(2);
+ 
+-        ggml_backend_buffer_type_t buft_host = ggml_backend_cpu_buffer_type();
+-        const size_t alignment_host = ggml_backend_buft_get_alignment(buft_host);
+-
+         for (size_t ig = 0; ig < groups.size(); ++ig) {
+             group & g = groups[ig];
+             if (g.n_slots == 0) {
+@@ -427,6 +558,82 @@ struct llama_moe_cache::impl {
+             }
+         }
+ 
++#if !defined(_WIN32)
++        if (is_paged_mode) {
++            for (group & g : groups) {
++                if (g.n_slots == 0) {
++                    continue;
++                }
++                g.upload_backend = std::make_unique<MoeCacheUploadBackend>();
++                g.upload_backend->backend = devices[g.id].backend;
++                g.upload_backend->banks   = g.banks;
++
++                size_t staging_capacity = 0;
++                size_t bytes_per_slot = 0;
++                for (const auto * t : g.ref) {
++                    staging_capacity = std::max<size_t>(staging_capacity, t->nb[2]);
++                    bytes_per_slot += t->nb[2];
++                }
++                g.quarantine = std::make_unique<ps5lm::moe::PagingQuarantine>(staging_capacity);
++
++                ps5lm::moe::SlotCacheOptions sc_opts;
++                sc_opts.slot_count = g.n_slots;
++                sc_opts.bytes_per_slot = bytes_per_slot;
++                sc_opts.byte_budget = alloc_size(g, g.n_slots);
++                sc_opts.max_in_flight_tokens = std::max<size_t>(64, g.layers.size() * 2);
++                sc_opts.max_request_keys = 4096;
++                g.slot_cache = std::make_unique<ps5lm::moe::SlotCache>(sc_opts);
++                if (g.slot_cache->configuration_status() != ps5lm::moe::SlotCacheStatus::Ok) {
++                    throw std::runtime_error("failed to initialize SlotCache");
++                }
++
++                std::vector<ps5lm::moe::LayerExpertTensorIds> layer_tensor_ids;
++                for (int32_t il : g.layers) {
++                    ps5lm::moe::LayerExpertTensorIds lids;
++                    lids.layer = static_cast<uint32_t>(il);
++                    const auto & layer = model.layers[il];
++                    if (layer.ffn_gate_exps) {
++                        model.paged_expert_tensor_id(layer.ffn_gate_exps, &lids.gate.tensor_id);
++                        lids.gate.bytes_per_expert = layer.ffn_gate_exps->nb[2];
++                    }
++                    if (layer.ffn_up_exps) {
++                        model.paged_expert_tensor_id(layer.ffn_up_exps, &lids.up.tensor_id);
++                        lids.up.bytes_per_expert = layer.ffn_up_exps->nb[2];
++                    }
++                    if (layer.ffn_down_exps) {
++                        model.paged_expert_tensor_id(layer.ffn_down_exps, &lids.down.tensor_id);
++                        lids.down.bytes_per_expert = layer.ffn_down_exps->nb[2];
++                    }
++                    if (layer.ffn_gate_up_exps) {
++                        uint64_t tid = 0;
++                        model.paged_expert_tensor_id(layer.ffn_gate_up_exps, &tid);
++                        lids.gate.tensor_id = tid;
++                        lids.gate.bytes_per_expert = layer.ffn_gate_up_exps->nb[2];
++                        lids.up.tensor_id = tid;
++                        lids.up.bytes_per_expert = layer.ffn_gate_up_exps->nb[2];
++                    }
++                    layer_tensor_ids.push_back(lids);
++                }
++
++                const auto * expert_source = model.paged_expert_source();
++                if (!expert_source) {
++                    throw std::runtime_error("paged MoE model missing ExpertSource");
++                }
++                g.runtime = std::make_unique<ps5lm::moe::PagingRuntime>(
++                    *g.slot_cache,
++                    *expert_source,
++                    *g.upload_backend,
++                    *g.quarantine,
++                    layer_tensor_ids,
++                    model.hparams.n_expert_used_max()
++                );
++                if (g.runtime->configuration_status() != ps5lm::moe::PagingStatus::Ok) {
++                    throw std::runtime_error("failed to initialize PagingRuntime");
++                }
++            }
++        }
++#endif
++
+         // as weights, the ops that read the banks run on the device and the slot maps are copied with the copy callback
+         for (device & d : devices) {
+             if (d.buf) {
+@@ -466,7 +673,8 @@ struct llama_moe_cache::impl {
+         const layer & l = layers[il];
+ 
+         // large batches use most experts of a layer, so they gain little from the cache and would evict the experts used in generation
+-        if (n_tokens == 0 || n_tokens > max_batch || std::min(n_tokens*n_expert_used, l.slot_map->ne[1]) > groups[l.ig].n_slots) {
++        const int64_t min_tokens = is_paged_mode ? 0 : 1;
++        if (n_tokens < min_tokens || n_tokens > max_batch || std::min(n_tokens*n_expert_used, l.slot_map->ne[1]) > groups[l.ig].n_slots) {
+             return nullptr;
+         }
+         return l.slot_map;
+@@ -582,6 +790,136 @@ struct llama_moe_cache::impl {
+         return true;
+     }
+ 
++    enum ggml_backend_sched_copy_result copy_v2(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
++        const auto it = layer_of.find(src);
++        if (it == layer_of.end()) {
++            return GGML_BACKEND_SCHED_COPY_NOT_HANDLED;
++        }
++
++        if (!is_paged_mode) {
++            bool ok = copy(backend, src, dst, graph);
++            return ok ? GGML_BACKEND_SCHED_COPY_HANDLED : GGML_BACKEND_SCHED_COPY_ERROR;
++        }
++
++#if !defined(_WIN32)
++        const int32_t il = it->second;
++        const layer & l = layers[il];
++        group & g = groups[l.ig];
++
++        GGML_ASSERT(backend == devices[g.id].backend);
++
++        const int n_nodes = ggml_graph_n_nodes(graph);
++        const ggml_tensor * lookup = nullptr;
++        for (int i = 0; i < n_nodes && lookup == nullptr; ++i) {
++            const ggml_tensor * node = ggml_graph_node(graph, i);
++            if (node->op == GGML_OP_GET_ROWS && node->src[0] == dst) {
++                lookup = node;
++            }
++        }
++        GGML_ASSERT(lookup != nullptr);
++
++        const ggml_tensor * sel = lookup->src[1];
++        for (int i = 0; i < n_nodes; ++i) {
++            const ggml_tensor * node = ggml_graph_node(graph, i);
++            if (node == sel || node == sel->view_src) {
++                GGML_ABORT("the experts of layer %d are selected in the same split as their MoE cache lookup", il);
++            }
++        }
++        GGML_ASSERT(ggml_is_contiguous(sel));
++
++        ids.resize(ggml_nelements(sel));
++        if (ids.empty()) {
++            ggml_backend_synchronize(backend);
++            for (auto token : g.pending_completion_tokens) {
++                g.slot_cache->complete(token);
++            }
++            g.pending_completion_tokens.clear();
++            ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
++            return GGML_BACKEND_SCHED_COPY_HANDLED;
++        }
++        ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
++        ggml_backend_synchronize(backend);
++
++        std::vector<uint32_t> requested;
++        requested.reserve(ids.size());
++        for (int32_t e : ids) {
++            GGML_ASSERT(e >= 0 && e < g.ref[0]->ne[2]);
++            requested.push_back(static_cast<uint32_t>(e));
++        }
++
++        for (auto token : g.pending_completion_tokens) {
++            g.slot_cache->complete(token);
++        }
++        g.pending_completion_tokens.clear();
++
++        ps5lm::moe::CompletionToken use_token = ++next_completion_token;
++        g.pending_completion_tokens.push_back(use_token);
++
++        auto res = g.runtime->load_layer(static_cast<uint32_t>(il), requested, use_token);
++        if (!res.ok()) {
++            LLAMA_LOG_ERROR("%s: layer %d paging failed: %s\n", __func__, il, ps5lm::moe::paging_status_name(res.status));
++            return GGML_BACKEND_SCHED_COPY_ERROR;
++        }
++
++        // Sync l.slot_map with current cache state
++        int32_t * slot_data = (int32_t *) l.slot_map->data;
++        const int32_t n_expert = g.ref[0]->ne[2];
++        std::fill(slot_data, slot_data + n_expert, -1);
++        for (size_t s = 0; s < (size_t) g.n_slots; ++s) {
++            ps5lm::moe::SlotView view;
++            if (g.slot_cache->inspect_slot(s, &view) && view.resident && view.key.layer == (uint32_t) il) {
++                if (view.key.expert < (uint32_t) n_expert) {
++                    slot_data[view.key.expert] = (int32_t) s;
++                }
++            }
++        }
++        for (const auto & a : res.assignments) {
++            if (a.key.expert < (uint32_t) n_expert) {
++                slot_data[a.key.expert] = (int32_t) a.slot;
++            }
++        }
++
++        ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
++        return GGML_BACKEND_SCHED_COPY_HANDLED;
++#else
++        return GGML_BACKEND_SCHED_COPY_ERROR;
++#endif
++    }
++
++    void complete_pending_paging() {
++#if !defined(_WIN32)
++        if (!is_paged_mode) {
++            return;
++        }
++        for (group & g : groups) {
++            if (g.slot_cache) {
++                for (auto token : g.pending_completion_tokens) {
++                    g.slot_cache->complete(token);
++                }
++                g.pending_completion_tokens.clear();
++            }
++        }
++#endif
++    }
++
++    void set_fault_injection(bool enable, int countdown) {
++#if !defined(_WIN32)
++        for (group & g : groups) {
++            if (g.upload_backend) {
++                g.upload_backend->fault_injection_enabled = enable;
++                g.upload_backend->fault_injection_countdown = countdown;
++            }
++        }
++#else
++        GGML_UNUSED(enable);
++        GGML_UNUSED(countdown);
++#endif
++    }
++
++    ggml_backend_buffer_type_t buft_slot_map() const {
++        return get_buft_slot_map();
++    }
++
+     void log_stats() const {
+         auto log = [](const char * name, const stats & st) {
+             const size_t n = st.hits + st.misses;
+@@ -621,6 +959,22 @@ bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml
+     return pimpl->copy(backend, src, dst, graph);
+ }
+ 
++enum ggml_backend_sched_copy_result llama_moe_cache::copy_v2(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
++    return pimpl->copy_v2(backend, src, dst, graph);
++}
++
++void llama_moe_cache::complete_pending_paging() {
++    pimpl->complete_pending_paging();
++}
++
++ggml_backend_buffer_type_t llama_moe_cache::buft_slot_map() const {
++    return pimpl->buft_slot_map();
++}
++
++void llama_moe_cache::set_fault_injection(bool enable, int countdown) {
++    pimpl->set_fault_injection(enable, countdown);
++}
++
+ int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
+     return pimpl->copy_experts(backend, w, dst, e, last);
+ }
+diff --git a/src/llama-moe-cache.h b/src/llama-moe-cache.h
+index 3b6726b..b4e1710 100644
+--- a/src/llama-moe-cache.h
++++ b/src/llama-moe-cache.h
+@@ -28,6 +28,18 @@ public:
+     // ggml_backend_sched copy callback, returns false if src is not a slot map
+     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
+ 
++    // v2 copy callback returning tri-state sched copy result
++    enum ggml_backend_sched_copy_result copy_v2(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
++
++    // complete any in-flight completion tokens in the slot cache
++    void complete_pending_paging();
++
++    // buffer type used for slot maps in host memory
++    ggml_backend_buffer_type_t buft_slot_map() const;
++
++    // fault injection for tests
++    void set_fault_injection(bool enable, int countdown = 0);
++
+     // for large batches: copy the experts of w that are in the cache, starting at expert e and up to expert last, to the copy dst of w
+     // returns the number of experts copied, 0 if expert e is not in the cache
+     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last);
+diff --git a/src/llama-quant.cpp b/src/llama-quant.cpp
+index 9c60667..a59ac9b 100644
+--- a/src/llama-quant.cpp
++++ b/src/llama-quant.cpp
+@@ -974,7 +974,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
+     const llama_model_kv_override * kv_overrides = params->kv_overrides;
+     std::vector<std::string> splits = {};
+     llama_model_loader ml(/*metadata*/ nullptr, /*set_tensor_data*/ nullptr, /*set_tensor_data_ud*/ nullptr,
+-        fname_inp, splits, /*file*/ nullptr, /*load_mode*/ load_mode, /*check_tensors*/ true, /*no_alloc*/ false, /*load_mtp*/ true, kv_overrides, nullptr);
++        fname_inp, splits, /*file*/ nullptr, /*load_mode*/ load_mode, /*check_tensors*/ true, /*no_alloc*/ false, /*load_mtp*/ true, /*use_moe_expert_paging*/ false, kv_overrides, nullptr);
+     ml.init_mappings(false); // no prefetching
+ 
+     auto mparams = llama_model_default_params();
+diff --git a/src/llama.cpp b/src/llama.cpp
+index 9beb148..0f2d6a3 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -316,8 +316,33 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
+ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
+         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
+     try {
++        if (params.use_moe_expert_paging) {
++#if defined(_WIN32)
++            throw std::runtime_error("MoE expert paging requires POSIX file descriptor support");
++#endif
++            if (params.load_mode == LLAMA_LOAD_MODE_AUTO) {
++                params.load_mode = LLAMA_LOAD_MODE_NONE;
++            }
++            if (params.lazy_mode == LLAMA_LAZY_MODE_AUTO) {
++                params.lazy_mode = LLAMA_LAZY_MODE_OFF;
++            }
++            if (params.split_mode == LLAMA_SPLIT_MODE_LAYER) {
++                params.split_mode = LLAMA_SPLIT_MODE_NONE;
++            }
++            if (params.tensor_buft_overrides != nullptr && params.tensor_buft_overrides[0].pattern == nullptr) {
++                params.tensor_buft_overrides = nullptr;
++            }
++            if (params.load_mode != LLAMA_LOAD_MODE_NONE || params.split_mode != LLAMA_SPLIT_MODE_NONE ||
++                params.lazy_mode != LLAMA_LAZY_MODE_OFF || params.check_tensors || params.no_alloc ||
++                params.vocab_only || params.load_mtp || params.use_extra_bufts || params.no_host ||
++                params.tensor_buft_overrides != nullptr) {
++                throw std::runtime_error("MoE expert paging requires load_mode=none, split_mode=none, lazy_mode=off, and default allocation, host, tensor-check, MTP, and tensor-override settings");
++            }
++        }
++
+         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
+-            params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
++            params.check_tensors, params.no_alloc, params.load_mtp, params.use_moe_expert_paging,
++            params.kv_overrides, params.tensor_buft_overrides);
+ 
+         ml.lazy.mode = params.lazy_mode;
+ 
+diff --git a/src/paging_runtime.cpp b/src/paging_runtime.cpp
+new file mode 100644
+index 0000000..fd99f86
+--- /dev/null
++++ b/src/paging_runtime.cpp
+@@ -0,0 +1,345 @@
++// Synchronous per-layer adapter between ExpertSource and SlotCache.
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#include "paging_runtime.hpp"
++
++#include <algorithm>
++#include <array>
++#include <exception>
++#include <new>
++#include <utility>
++
++namespace ps5lm::moe {
++
++const char * paging_status_name(PagingStatus status) noexcept {
++    switch (status) {
++        case PagingStatus::Ok: return "ok";
++        case PagingStatus::InvalidConfiguration: return "invalid_configuration";
++        case PagingStatus::InvalidLayer: return "invalid_layer";
++        case PagingStatus::RequestTooLarge: return "request_too_large";
++        case PagingStatus::Cancelled: return "cancelled";
++        case PagingStatus::CacheFailure: return "cache_failure";
++        case PagingStatus::SourceFailure: return "source_failure";
++        case PagingStatus::UploadRejected: return "upload_rejected";
++        case PagingStatus::UploadFailed: return "upload_failed";
++        case PagingStatus::FenceUnresolved: return "fence_unresolved";
++        case PagingStatus::Quarantined: return "quarantined";
++        case PagingStatus::OutOfMemory: return "out_of_memory";
++    }
++    return "unknown";
++}
++
++PagingQuarantine::PagingQuarantine(std::size_t staging_capacity) {
++    if (staging_capacity != 0) {
++        staging_.resize(staging_capacity);
++    }
++}
++
++PagingQuarantine::~PagingQuarantine() noexcept {
++    // Dropping an unresolved Reservation would invoke its rollback destructor,
++    // potentially making a slot available while a transfer still uses it.
++    if (leased_ || pending_) {
++        std::terminate();
++    }
++}
++
++bool PagingQuarantine::acquire(ExpertUploadBackend & backend) noexcept {
++    if (leased_ || pending_ || staging_.empty() || (backend_ != nullptr && backend_ != &backend)) {
++        return false;
++    }
++    leased_ = true;
++    backend_ = &backend;
++    return true;
++}
++
++void PagingQuarantine::release() noexcept {
++    leased_ = false;
++}
++
++void PagingQuarantine::quarantine(
++        Reservation && reservation,
++        ExpertKey key,
++        ExpertTensorRole role,
++        std::size_t slot,
++        UploadToken transfer) noexcept {
++    if (pending_ || !reservation.active() || !leased_ || backend_ == nullptr) {
++        std::terminate();
++    }
++    pending_.emplace(std::move(reservation));
++    pending_transfer_ = transfer;
++    pending_key_ = key;
++    pending_role_ = role;
++    pending_slot_ = slot;
++}
++
++QuarantineStatus PagingQuarantine::release_after_backend_quiesced(ExpertUploadBackend & backend) noexcept {
++    if (!pending_) {
++        return QuarantineStatus::NotPending;
++    }
++    if (backend_ != &backend) {
++        return QuarantineStatus::StillUnsafe;
++    }
++    const TransferFenceStatus status = backend.quiesce();
++    if (status == TransferFenceStatus::Indeterminate) {
++        return QuarantineStatus::StillUnsafe;
++    }
++    pending_->rollback();
++    pending_.reset();
++    pending_transfer_ = 0;
++    pending_key_ = {};
++    pending_role_ = ExpertTensorRole::Gate;
++    pending_slot_ = kNoSlot;
++    if (!leased_) {
++        backend_ = nullptr;
++    }
++    return QuarantineStatus::Released;
++}
++
++PagingRuntime::PagingRuntime(
++        SlotCache & cache,
++        const ExpertSource & source,
++        ExpertUploadBackend & backend,
++        PagingQuarantine & quarantine,
++        const std::vector<LayerExpertTensorIds> & tensor_ids,
++        std::size_t max_selected_experts)
++    : cache_(cache),
++      source_(source),
++      backend_(backend),
++      quarantine_(quarantine),
++      max_selected_experts_(max_selected_experts) {
++    if (cache.configuration_status() != SlotCacheStatus::Ok ||
++        source.max_expert_bytes() == 0 || quarantine.staging_capacity() == 0 ||
++        quarantine.staging_capacity() > source.max_expert_bytes() ||
++        max_selected_experts == 0 || max_selected_experts > kHardSelectedExpertLimit ||
++        tensor_ids.empty() || tensor_ids.size() > kHardLayerLimit) {
++        configuration_status_ = PagingStatus::InvalidConfiguration;
++        return;
++    }
++
++    try {
++        for (const LayerExpertTensorIds & layer : tensor_ids) {
++            const std::array<ExpertTensorRef, 3> refs = {layer.gate, layer.up, layer.down};
++            if (refs[0].tensor_id == refs[1].tensor_id || refs[0].tensor_id == refs[2].tensor_id ||
++                refs[1].tensor_id == refs[2].tensor_id) {
++                configuration_status_ = PagingStatus::InvalidConfiguration;
++                return;
++            }
++            for (const ExpertTensorRef & ref : refs) {
++                if (ref.bytes_per_expert == 0 || ref.bytes_per_expert > quarantine.staging_capacity()) {
++                    configuration_status_ = PagingStatus::InvalidConfiguration;
++                    return;
++                }
++            }
++            if (!tensor_ids_.emplace(layer.layer, layer).second) {
++                configuration_status_ = PagingStatus::InvalidConfiguration;
++                return;
++            }
++        }
++    } catch (const std::bad_alloc &) {
++        configuration_status_ = PagingStatus::OutOfMemory;
++        return;
++    } catch (...) {
++        configuration_status_ = PagingStatus::OutOfMemory;
++        return;
++    }
++
++    if (!quarantine.acquire(backend)) {
++        configuration_status_ = PagingStatus::InvalidConfiguration;
++        return;
++    }
++    leased_ = true;
++    configuration_status_ = PagingStatus::Ok;
++}
++
++PagingRuntime::~PagingRuntime() noexcept {
++    if (leased_) {
++        quarantine_.release();
++    }
++}
++
++const LayerExpertTensorIds * PagingRuntime::find_layer(std::uint32_t layer) const noexcept {
++    const auto found = tensor_ids_.find(layer);
++    return found == tensor_ids_.end() ? nullptr : &found->second;
++}
++
++bool PagingRuntime::is_cancelled(const std::atomic_bool * cancelled) const noexcept {
++    return cancelled != nullptr && cancelled->load(std::memory_order_relaxed);
++}
++
++PagingResult PagingRuntime::fail_with_cache(PagingResult result, SlotCacheStatus status) const noexcept {
++    result.status = PagingStatus::CacheFailure;
++    result.cache_status = status;
++    return result;
++}
++
++PagingResult PagingRuntime::load_layer(
++        std::uint32_t layer,
++        const std::vector<std::uint32_t> & selected_experts,
++        CompletionToken gpu_use_token,
++        const std::atomic_bool * cancelled) noexcept {
++    PagingResult result;
++    if (configuration_status_ != PagingStatus::Ok) {
++        result.status = configuration_status_;
++        return result;
++    }
++    if (poisoned_ || quarantine_.pending()) {
++        result.status = PagingStatus::Quarantined;
++        return result;
++    }
++    if (is_cancelled(cancelled)) {
++        result.status = PagingStatus::Cancelled;
++        return result;
++    }
++    if (selected_experts.empty()) {
++        return fail_with_cache(std::move(result), SlotCacheStatus::InvalidRequest);
++    }
++    if (selected_experts.size() > max_selected_experts_) {
++        result.status = PagingStatus::RequestTooLarge;
++        return result;
++    }
++    const LayerExpertTensorIds * tensors = find_layer(layer);
++    if (tensors == nullptr) {
++        result.status = PagingStatus::InvalidLayer;
++        return result;
++    }
++
++    std::vector<ExpertKey> keys;
++    try {
++        keys.reserve(selected_experts.size());
++        for (const std::uint32_t expert : selected_experts) {
++            keys.push_back({layer, expert});
++        }
++    } catch (...) {
++        result.status = PagingStatus::OutOfMemory;
++        return result;
++    }
++
++    ReserveResult reserved;
++    try {
++        reserved = cache_.reserve(keys);
++    } catch (...) {
++        result.status = PagingStatus::OutOfMemory;
++        return result;
++    }
++    if (!reserved.ok()) {
++        return fail_with_cache(std::move(result), reserved.status);
++    }
++    Reservation & reservation = reserved.reservation;
++
++    const std::array<std::pair<ExpertTensorRole, ExpertTensorRef>, 3> roles = {{
++        {ExpertTensorRole::Gate, tensors->gate},
++        {ExpertTensorRole::Up,   tensors->up},
++        {ExpertTensorRole::Down, tensors->down},
++    }};
++
++    for (const SlotAssignment & assignment : reservation.assignments()) {
++        if (!assignment.needs_upload) {
++            continue;
++        }
++        for (const auto & role_ref : roles) {
++            const ExpertTensorRole role = role_ref.first;
++            const ExpertTensorRef & tensor = role_ref.second;
++            result.failed_key = assignment.key;
++            result.failed_role = role;
++
++            if (is_cancelled(cancelled)) {
++                reservation.rollback();
++                result.status = PagingStatus::Cancelled;
++                return result;
++            }
++
++            std::fill_n(quarantine_.staging_.begin(), tensor.bytes_per_expert, 0);
++            const ReadError read = source_.read_expert(
++                    tensor.tensor_id,
++                    assignment.key.expert,
++                    quarantine_.staging_.data(),
++                    tensor.bytes_per_expert,
++                    cancelled);
++            if (!read.ok()) {
++                reservation.rollback();
++                result.read_error = read;
++                result.status = read.status == ReadStatus::Cancelled ?
++                        PagingStatus::Cancelled : PagingStatus::SourceFailure;
++                return result;
++            }
++
++            if (is_cancelled(cancelled)) {
++                reservation.rollback();
++                result.status = PagingStatus::Cancelled;
++                return result;
++            }
++
++            const UploadSubmission submission = backend_.submit_upload(
++                    assignment.key,
++                    role,
++                    assignment.slot,
++                    quarantine_.staging_.data(),
++                    tensor.bytes_per_expert);
++            if (!submission.submitted) {
++                reservation.rollback();
++                result.status = PagingStatus::UploadRejected;
++                return result;
++            }
++
++            result.transfer_token = submission.token;
++            if (submission.token == 0) {
++                quarantine_.quarantine(
++                        std::move(reservation), assignment.key, role, assignment.slot, submission.token);
++                poisoned_ = true;
++                result.status = PagingStatus::FenceUnresolved;
++                return result;
++            }
++
++            const TransferFenceStatus transfer_status = backend_.wait_transfer(submission.token);
++            if (transfer_status == TransferFenceStatus::Indeterminate) {
++                quarantine_.quarantine(
++                        std::move(reservation), assignment.key, role, assignment.slot, submission.token);
++                poisoned_ = true;
++                result.status = PagingStatus::FenceUnresolved;
++                return result;
++            }
++            if (transfer_status == TransferFenceStatus::FailedButQuiesced) {
++                reservation.rollback();
++                result.status = PagingStatus::UploadFailed;
++                return result;
++            }
++
++            if (is_cancelled(cancelled)) {
++                reservation.rollback();
++                result.status = PagingStatus::Cancelled;
++                return result;
++            }
++        }
++
++        const SlotCacheStatus marked = reservation.mark_upload_complete(assignment.key);
++        if (marked != SlotCacheStatus::Ok) {
++            reservation.rollback();
++            return fail_with_cache(std::move(result), marked);
++        }
++    }
++
++    if (is_cancelled(cancelled)) {
++        reservation.rollback();
++        result.status = PagingStatus::Cancelled;
++        return result;
++    }
++
++    try {
++        result.assignments = reservation.assignments();
++    } catch (...) {
++        reservation.rollback();
++        result.status = PagingStatus::OutOfMemory;
++        return result;
++    }
++    const SlotCacheStatus committed = reservation.commit(gpu_use_token);
++    if (committed != SlotCacheStatus::Ok) {
++        reservation.rollback();
++        result.assignments.clear();
++        return fail_with_cache(std::move(result), committed);
++    }
++    result.gpu_use_token = gpu_use_token;
++    result.status = PagingStatus::Ok;
++    return result;
++}
++
++}  // namespace ps5lm::moe
+diff --git a/src/paging_runtime.hpp b/src/paging_runtime.hpp
+new file mode 100644
+index 0000000..8df87fb
+--- /dev/null
++++ b/src/paging_runtime.hpp
+@@ -0,0 +1,195 @@
++// Synchronous per-layer adapter between ExpertSource and SlotCache.
++// SPDX-License-Identifier: GPL-3.0-or-later
++#pragma once
++
++#include "expert_source.hpp"
++#include "slot_cache.hpp"
++
++#include <atomic>
++#include <cstddef>
++#include <cstdint>
++#include <map>
++#include <optional>
++#include <vector>
++
++namespace ps5lm::moe {
++
++using UploadToken = std::uint64_t;
++
++enum class ExpertTensorRole : std::uint8_t { Gate, Up, Down };
++
++struct ExpertTensorRef {
++    std::uint64_t tensor_id = 0;
++    // Exact per-expert stride from the same validated metadata used to build
++    // ExpertSource. ExpertSource::read_expert does not return a byte count.
++    std::size_t bytes_per_expert = 0;
++};
++
++struct LayerExpertTensorIds {
++    std::uint32_t layer = 0;
++    ExpertTensorRef gate{};
++    ExpertTensorRef up{};
++    ExpertTensorRef down{};
++};
++
++enum class TransferFenceStatus : std::uint8_t {
++    Complete,
++    FailedButQuiesced,
++    Indeterminate,
++};
++
++struct UploadSubmission {
++    // false guarantees that no work was accepted and the source pointer is no
++    // longer retained. true requires a valid token unless the caller will
++    // quarantine and globally quiesce the backend.
++    bool submitted = false;
++    UploadToken token = 0;
++};
++
++// Backend contract: submit_upload() may retain source_bytes only while its
++// returned token is outstanding. wait_transfer() must return Complete or
++// FailedButQuiesced only when it guarantees no further source/destination
++// access. Indeterminate means the caller cannot reuse either resource.
++class ExpertUploadBackend {
++public:
++    virtual ~ExpertUploadBackend() = default;
++
++    virtual UploadSubmission submit_upload(
++            ExpertKey key,
++            ExpertTensorRole role,
++            std::size_t slot,
++            const void * source_bytes,
++            std::size_t byte_count) noexcept = 0;
++
++    virtual TransferFenceStatus wait_transfer(UploadToken token) noexcept = 0;
++
++    // Stops/drains all accepted transfers. Only Complete or FailedButQuiesced
++    // confirms that no outstanding transfer can access staging or cache slots.
++    virtual TransferFenceStatus quiesce() noexcept = 0;
++};
++
++enum class PagingStatus : std::uint8_t {
++    Ok,
++    InvalidConfiguration,
++    InvalidLayer,
++    RequestTooLarge,
++    Cancelled,
++    CacheFailure,
++    SourceFailure,
++    UploadRejected,
++    UploadFailed,
++    FenceUnresolved,
++    Quarantined,
++    OutOfMemory,
++};
++
++const char * paging_status_name(PagingStatus status) noexcept;
++
++struct PagingResult {
++    PagingStatus status = PagingStatus::InvalidConfiguration;
++    SlotCacheStatus cache_status = SlotCacheStatus::Ok;
++    ReadError read_error{};
++    ExpertKey failed_key{};
++    ExpertTensorRole failed_role = ExpertTensorRole::Gate;
++    UploadToken transfer_token = 0;
++    CompletionToken gpu_use_token = 0;
++    std::vector<SlotAssignment> assignments;
++
++    bool ok() const noexcept { return status == PagingStatus::Ok; }
++};
++
++enum class QuarantineStatus : std::uint8_t {
++    Released,
++    NotPending,
++    StillUnsafe,
++};
++
++// Owns exactly one fixed reusable staging buffer. If a transfer fence becomes
++// indeterminate it also owns the active reservation, preventing slot rollback
++// and staging destruction until backend-wide quiescence is confirmed.
++class PagingQuarantine final {
++public:
++    explicit PagingQuarantine(std::size_t staging_capacity);
++    ~PagingQuarantine() noexcept;
++    PagingQuarantine(const PagingQuarantine &) = delete;
++    PagingQuarantine & operator=(const PagingQuarantine &) = delete;
++
++    std::size_t staging_capacity() const noexcept { return staging_.size(); }
++    bool pending() const noexcept { return pending_.has_value(); }
++    UploadToken pending_transfer() const noexcept { return pending_transfer_; }
++    ExpertKey pending_key() const noexcept { return pending_key_; }
++    ExpertTensorRole pending_role() const noexcept { return pending_role_; }
++    std::size_t pending_slot() const noexcept { return pending_slot_; }
++
++    // This method calls backend.quiesce(). It releases the reservation only
++    // after a result that guarantees no transfer remains in flight.
++    QuarantineStatus release_after_backend_quiesced(ExpertUploadBackend & backend) noexcept;
++
++private:
++    friend class PagingRuntime;
++
++    bool acquire(ExpertUploadBackend & backend) noexcept;
++    void release() noexcept;
++    void quarantine(
++            Reservation && reservation,
++            ExpertKey key,
++            ExpertTensorRole role,
++            std::size_t slot,
++            UploadToken transfer) noexcept;
++
++    std::vector<std::uint8_t> staging_;
++    std::optional<Reservation> pending_;
++    bool leased_ = false;
++    ExpertUploadBackend * backend_ = nullptr;
++    UploadToken pending_transfer_ = 0;
++    ExpertKey pending_key_{};
++    ExpertTensorRole pending_role_ = ExpertTensorRole::Gate;
++    std::size_t pending_slot_ = kNoSlot;
++};
++
++class PagingRuntime final {
++public:
++    static constexpr std::size_t kHardLayerLimit = 1024;
++    static constexpr std::size_t kHardSelectedExpertLimit = 256;
++
++    PagingRuntime(
++            SlotCache & cache,
++            const ExpertSource & source,
++            ExpertUploadBackend & backend,
++            PagingQuarantine & quarantine,
++            const std::vector<LayerExpertTensorIds> & tensor_ids,
++            std::size_t max_selected_experts = 64);
++    ~PagingRuntime() noexcept;
++    PagingRuntime(const PagingRuntime &) = delete;
++    PagingRuntime & operator=(const PagingRuntime &) = delete;
++
++    PagingStatus configuration_status() const noexcept { return configuration_status_; }
++    bool poisoned() const noexcept { return poisoned_; }
++
++    // Uploads every selected expert's gate, up and down slices for one layer.
++    // Duplicate expert IDs consume one cache slot and one set of role reads.
++    // The caller must not submit GPU compute using assignments until this
++    // returns Ok; gpu_use_token pins the slots until SlotCache::complete().
++    PagingResult load_layer(
++            std::uint32_t layer,
++            const std::vector<std::uint32_t> & selected_experts,
++            CompletionToken gpu_use_token,
++            const std::atomic_bool * cancelled = nullptr) noexcept;
++
++private:
++    const LayerExpertTensorIds * find_layer(std::uint32_t layer) const noexcept;
++    bool is_cancelled(const std::atomic_bool * cancelled) const noexcept;
++    PagingResult fail_with_cache(PagingResult result, SlotCacheStatus status) const noexcept;
++
++    SlotCache & cache_;
++    const ExpertSource & source_;
++    ExpertUploadBackend & backend_;
++    PagingQuarantine & quarantine_;
++    std::map<std::uint32_t, LayerExpertTensorIds> tensor_ids_;
++    std::size_t max_selected_experts_ = 0;
++    PagingStatus configuration_status_ = PagingStatus::InvalidConfiguration;
++    bool leased_ = false;
++    bool poisoned_ = false;
++};
++
++}  // namespace ps5lm::moe
+diff --git a/src/slot_cache.cpp b/src/slot_cache.cpp
+new file mode 100644
+index 0000000..69423df
+--- /dev/null
++++ b/src/slot_cache.cpp
+@@ -0,0 +1,474 @@
++// Backend-independent transactional slot policy for MoE expert paging.
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#include "slot_cache.hpp"
++
++#include <algorithm>
++#include <limits>
++#include <new>
++#include <utility>
++
++namespace ps5lm::moe {
++namespace {
++
++bool checked_multiply(std::size_t a, std::size_t b, std::size_t * out) noexcept {
++    if (out == nullptr || (a != 0 && b > std::numeric_limits<std::size_t>::max() / a)) {
++        return false;
++    }
++    *out = a * b;
++    return true;
++}
++
++}  // namespace
++
++const char * slot_cache_status_name(SlotCacheStatus status) noexcept {
++    switch (status) {
++        case SlotCacheStatus::Ok: return "ok";
++        case SlotCacheStatus::InvalidConfiguration: return "invalid_configuration";
++        case SlotCacheStatus::BudgetExceeded: return "budget_exceeded";
++        case SlotCacheStatus::TooManySlots: return "too_many_slots";
++        case SlotCacheStatus::OutOfMemory: return "out_of_memory";
++        case SlotCacheStatus::InvalidRequest: return "invalid_request";
++        case SlotCacheStatus::RequestTooLarge: return "request_too_large";
++        case SlotCacheStatus::TooManyUniqueExperts: return "too_many_unique_experts";
++        case SlotCacheStatus::TooManyOutstandingBatches: return "too_many_outstanding_batches";
++        case SlotCacheStatus::KeyReserved: return "key_reserved";
++        case SlotCacheStatus::InsufficientUnpinnedSlots: return "insufficient_unpinned_slots";
++        case SlotCacheStatus::InvalidReservation: return "invalid_reservation";
++        case SlotCacheStatus::UploadNotRequired: return "upload_not_required";
++        case SlotCacheStatus::UploadsIncomplete: return "uploads_incomplete";
++        case SlotCacheStatus::InvalidCompletionToken: return "invalid_completion_token";
++        case SlotCacheStatus::TooManyInFlightTokens: return "too_many_in_flight_tokens";
++        case SlotCacheStatus::UnknownCompletionToken: return "unknown_completion_token";
++        case SlotCacheStatus::InternalError: return "internal_error";
++    }
++    return "unknown";
++}
++
++Reservation::Reservation(
++        SlotCache * owner,
++        std::uint64_t id,
++        std::vector<SlotAssignment> assignments) noexcept
++    : owner_(owner), id_(id), active_(owner != nullptr), assignments_(std::move(assignments)) {}
++
++Reservation::~Reservation() noexcept {
++    rollback();
++}
++
++Reservation::Reservation(Reservation && other) noexcept
++    : owner_(other.owner_),
++      id_(other.id_),
++      active_(other.active_),
++      assignments_(std::move(other.assignments_)) {
++    other.owner_ = nullptr;
++    other.id_ = 0;
++    other.active_ = false;
++}
++
++Reservation & Reservation::operator=(Reservation && other) noexcept {
++    if (this != &other) {
++        rollback();
++        owner_ = other.owner_;
++        id_ = other.id_;
++        active_ = other.active_;
++        assignments_ = std::move(other.assignments_);
++        other.owner_ = nullptr;
++        other.id_ = 0;
++        other.active_ = false;
++    }
++    return *this;
++}
++
++bool Reservation::slot_for(ExpertKey key, std::size_t * slot_out) const noexcept {
++    if (!active_ || slot_out == nullptr) {
++        return false;
++    }
++    for (const SlotAssignment & assignment : assignments_) {
++        if (assignment.key == key) {
++            *slot_out = assignment.slot;
++            return true;
++        }
++    }
++    return false;
++}
++
++SlotCacheStatus Reservation::mark_upload_complete(ExpertKey key) noexcept {
++    if (!active_ || owner_ == nullptr) {
++        return SlotCacheStatus::InvalidReservation;
++    }
++    for (SlotAssignment & assignment : assignments_) {
++        if (assignment.key == key) {
++            if (!assignment.needs_upload) {
++                return SlotCacheStatus::UploadNotRequired;
++            }
++            assignment.upload_complete = true;
++            return SlotCacheStatus::Ok;
++        }
++    }
++    return SlotCacheStatus::InvalidRequest;
++}
++
++SlotCacheStatus Reservation::commit(CompletionToken token) noexcept {
++    if (!active_ || owner_ == nullptr) {
++        return SlotCacheStatus::InvalidReservation;
++    }
++    return owner_->commit(*this, token);
++}
++
++void Reservation::rollback() noexcept {
++    if (active_ && owner_ != nullptr) {
++        owner_->rollback(*this);
++    }
++}
++
++SlotCache::SlotCache(const SlotCacheOptions & options) noexcept : options_(options) {
++    if (options.slot_count == 0 || options.bytes_per_slot == 0 || options.byte_budget == 0 ||
++        options.max_request_keys == 0 || options.max_in_flight_tokens == 0) {
++        configuration_status_ = SlotCacheStatus::InvalidConfiguration;
++        return;
++    }
++    if (options.slot_count > kHardSlotLimit) {
++        configuration_status_ = SlotCacheStatus::TooManySlots;
++        return;
++    }
++    if (options.max_request_keys > kHardRequestKeyLimit ||
++        options.max_in_flight_tokens > kHardInFlightLimit) {
++        configuration_status_ = SlotCacheStatus::InvalidConfiguration;
++        return;
++    }
++    if (!checked_multiply(options.slot_count, options.bytes_per_slot, &configured_capacity_bytes_)) {
++        configuration_status_ = SlotCacheStatus::InvalidConfiguration;
++        return;
++    }
++    if (configured_capacity_bytes_ > options.byte_budget) {
++        configuration_status_ = SlotCacheStatus::BudgetExceeded;
++        return;
++    }
++    try {
++        slots_.resize(options.slot_count);
++    } catch (const std::bad_alloc &) {
++        configuration_status_ = SlotCacheStatus::OutOfMemory;
++        return;
++    } catch (...) {
++        configuration_status_ = SlotCacheStatus::OutOfMemory;
++        return;
++    }
++    configuration_status_ = SlotCacheStatus::Ok;
++}
++
++std::size_t SlotCache::find_resident_locked(ExpertKey key) const noexcept {
++    for (std::size_t i = 0; i < slots_.size(); ++i) {
++        const Slot & slot = slots_[i];
++        if (slot.state == State::Resident && slot.key == key) {
++            return i;
++        }
++    }
++    return kNoSlot;
++}
++
++std::size_t SlotCache::find_reserved_locked(ExpertKey key) const noexcept {
++    for (std::size_t i = 0; i < slots_.size(); ++i) {
++        const Slot & slot = slots_[i];
++        if (slot.state == State::Reserved && slot.key == key) {
++            return i;
++        }
++    }
++    return kNoSlot;
++}
++
++std::uint64_t SlotCache::next_lru_stamp() noexcept {
++    if (lru_clock_ != std::numeric_limits<std::uint64_t>::max()) {
++        return ++lru_clock_;
++    }
++    // This is only reachable after 2^64 cache touches. Saturating keeps the
++    // operation defined; ties are then resolved by the lowest slot index.
++    return lru_clock_;
++}
++
++ReserveResult SlotCache::reserve(const std::vector<ExpertKey> & requested) {
++    ReserveResult result;
++    result.status = configuration_status_;
++    if (configuration_status_ != SlotCacheStatus::Ok) {
++        return result;
++    }
++    if (requested.empty()) {
++        result.status = SlotCacheStatus::InvalidRequest;
++        return result;
++    }
++    if (requested.size() > options_.max_request_keys) {
++        result.status = SlotCacheStatus::RequestTooLarge;
++        return result;
++    }
++
++    std::vector<SlotAssignment> assignments;
++    std::vector<bool> protected_slots;
++    try {
++        assignments.reserve(requested.size());
++        protected_slots.resize(slots_.size(), false);
++        for (const ExpertKey key : requested) {
++            const auto found = std::find_if(assignments.begin(), assignments.end(),
++                    [key](const SlotAssignment & entry) { return entry.key == key; });
++            if (found == assignments.end()) {
++                assignments.push_back({key, kNoSlot, false, false});
++            }
++        }
++    } catch (...) {
++        result.status = SlotCacheStatus::OutOfMemory;
++        return result;
++    }
++    if (assignments.size() > slots_.size()) {
++        result.status = SlotCacheStatus::TooManyUniqueExperts;
++        return result;
++    }
++
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (active_reservations_ >= kHardInFlightLimit) {
++        result.status = SlotCacheStatus::TooManyOutstandingBatches;
++        return result;
++    }
++
++    // Resolve all hits first. A matching in-progress upload conflicts with
++    // the entire request; no partial slot state is changed in this pass.
++    for (SlotAssignment & assignment : assignments) {
++        const std::size_t resident = find_resident_locked(assignment.key);
++        if (resident != kNoSlot) {
++            assignment.slot = resident;
++            protected_slots[resident] = true;
++            continue;
++        }
++        if (find_reserved_locked(assignment.key) != kNoSlot) {
++            result.status = SlotCacheStatus::KeyReserved;
++            return result;
++        }
++        assignment.needs_upload = true;
++    }
++
++    // Plan every miss before mutating the cache. Empty slots are preferred;
++    // otherwise choose the oldest resident slot that has no reservation or
++    // GPU-use pins. Hits and earlier candidates are excluded.
++    for (SlotAssignment & assignment : assignments) {
++        if (!assignment.needs_upload) {
++            continue;
++        }
++        std::size_t candidate = kNoSlot;
++        for (std::size_t i = 0; i < slots_.size(); ++i) {
++            if (!protected_slots[i] && slots_[i].state == State::Empty) {
++                candidate = i;
++                break;
++            }
++        }
++        if (candidate == kNoSlot) {
++            std::uint64_t oldest = std::numeric_limits<std::uint64_t>::max();
++            for (std::size_t i = 0; i < slots_.size(); ++i) {
++                const Slot & slot = slots_[i];
++                if (protected_slots[i] || slot.state != State::Resident ||
++                    slot.reservation_refs != 0 || slot.gpu_use_refs != 0) {
++                    continue;
++                }
++                if (candidate == kNoSlot || slot.last_use < oldest) {
++                    candidate = i;
++                    oldest = slot.last_use;
++                }
++            }
++        }
++        if (candidate == kNoSlot) {
++            result.status = SlotCacheStatus::InsufficientUnpinnedSlots;
++            return result;
++        }
++        assignment.slot = candidate;
++        protected_slots[candidate] = true;
++    }
++
++    std::uint64_t id = next_transaction_id_++;
++    if (id == 0) {
++        id = next_transaction_id_++;
++    }
++    if (next_transaction_id_ == 0) {
++        next_transaction_id_ = 1;
++    }
++    for (const SlotAssignment & assignment : assignments) {
++        Slot & slot = slots_[assignment.slot];
++        if (assignment.needs_upload) {
++            slot.state = State::Reserved;
++            slot.key = assignment.key;
++            slot.reservation_refs = 0;
++            slot.gpu_use_refs = 0;
++            slot.pending_transaction = id;
++            slot.last_use = next_lru_stamp();
++        } else {
++            ++slot.reservation_refs;
++        }
++    }
++    ++active_reservations_;
++    result.status = SlotCacheStatus::Ok;
++    result.reservation = Reservation(this, id, std::move(assignments));
++    return result;
++}
++
++SlotCacheStatus SlotCache::commit(Reservation & reservation, CompletionToken token) noexcept {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!reservation.active_ || reservation.owner_ != this || reservation.id_ == 0) {
++        return SlotCacheStatus::InvalidReservation;
++    }
++    if (token == 0 || token <= last_completion_token_) {
++        return SlotCacheStatus::InvalidCompletionToken;
++    }
++    if (token_slots_.size() >= options_.max_in_flight_tokens) {
++        return SlotCacheStatus::TooManyInFlightTokens;
++    }
++    for (const SlotAssignment & assignment : reservation.assignments_) {
++        if (assignment.needs_upload && !assignment.upload_complete) {
++            return SlotCacheStatus::UploadsIncomplete;
++        }
++        if (assignment.slot >= slots_.size()) {
++            return SlotCacheStatus::InternalError;
++        }
++        const Slot & slot = slots_[assignment.slot];
++        if (assignment.needs_upload) {
++            if (slot.state != State::Reserved || slot.pending_transaction != reservation.id_ ||
++                slot.key != assignment.key) {
++                return SlotCacheStatus::InvalidReservation;
++            }
++        } else if (slot.state != State::Resident || slot.key != assignment.key ||
++                   slot.reservation_refs == 0) {
++                return SlotCacheStatus::InvalidReservation;
++        }
++    }
++
++    std::vector<std::size_t> pinned_slots;
++    try {
++        pinned_slots.reserve(reservation.assignments_.size());
++        for (const SlotAssignment & assignment : reservation.assignments_) {
++            pinned_slots.push_back(assignment.slot);
++        }
++        const auto inserted = token_slots_.emplace(token, std::move(pinned_slots));
++        if (!inserted.second) {
++            return SlotCacheStatus::InvalidCompletionToken;
++        }
++    } catch (...) {
++        return SlotCacheStatus::OutOfMemory;
++    }
++
++    for (const SlotAssignment & assignment : reservation.assignments_) {
++        Slot & slot = slots_[assignment.slot];
++        if (assignment.needs_upload) {
++            slot.state = State::Resident;
++            slot.pending_transaction = 0;
++        } else {
++            --slot.reservation_refs;
++        }
++        ++slot.gpu_use_refs;
++        slot.last_use = next_lru_stamp();
++    }
++    last_completion_token_ = token;
++    if (active_reservations_ != 0) {
++        --active_reservations_;
++    }
++    reservation.owner_ = nullptr;
++    reservation.id_ = 0;
++    reservation.active_ = false;
++    reservation.assignments_.clear();
++    return SlotCacheStatus::Ok;
++}
++
++void SlotCache::rollback(Reservation & reservation) noexcept {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!reservation.active_ || reservation.owner_ != this || reservation.id_ == 0) {
++        reservation.owner_ = nullptr;
++        reservation.id_ = 0;
++        reservation.active_ = false;
++        reservation.assignments_.clear();
++        return;
++    }
++    for (const SlotAssignment & assignment : reservation.assignments_) {
++        if (assignment.slot >= slots_.size()) {
++            continue;
++        }
++        Slot & slot = slots_[assignment.slot];
++        if (assignment.needs_upload) {
++            if (slot.state == State::Reserved && slot.pending_transaction == reservation.id_) {
++                slot = Slot{};
++            }
++        } else if (slot.state == State::Resident && slot.key == assignment.key &&
++                   slot.reservation_refs != 0) {
++            --slot.reservation_refs;
++        }
++    }
++    if (active_reservations_ != 0) {
++        --active_reservations_;
++    }
++    reservation.owner_ = nullptr;
++    reservation.id_ = 0;
++    reservation.active_ = false;
++    reservation.assignments_.clear();
++}
++
++SlotCacheStatus SlotCache::complete(CompletionToken token) noexcept {
++    std::lock_guard<std::mutex> lock(mutex_);
++    const auto found = token_slots_.find(token);
++    if (found == token_slots_.end()) {
++        return SlotCacheStatus::UnknownCompletionToken;
++    }
++    for (const std::size_t index : found->second) {
++        if (index >= slots_.size() || slots_[index].gpu_use_refs == 0) {
++            return SlotCacheStatus::InternalError;
++        }
++    }
++    for (const std::size_t index : found->second) {
++        --slots_[index].gpu_use_refs;
++    }
++    token_slots_.erase(found);
++    return SlotCacheStatus::Ok;
++}
++
++bool SlotCache::find_slot(ExpertKey key, std::size_t * slot_out) const noexcept {
++    if (slot_out == nullptr) {
++        return false;
++    }
++    std::lock_guard<std::mutex> lock(mutex_);
++    const std::size_t found = find_resident_locked(key);
++    if (found == kNoSlot) {
++        return false;
++    }
++    *slot_out = found;
++    return true;
++}
++
++bool SlotCache::inspect_slot(std::size_t index, SlotView * view_out) const noexcept {
++    if (view_out == nullptr || index >= slots_.size()) {
++        return false;
++    }
++    std::lock_guard<std::mutex> lock(mutex_);
++    const Slot & slot = slots_[index];
++    view_out->resident = slot.state == State::Resident;
++    view_out->reserved = slot.state == State::Reserved;
++    view_out->key = slot.key;
++    view_out->outstanding_reservations = slot.reservation_refs;
++    view_out->outstanding_gpu_uses = slot.gpu_use_refs;
++    return true;
++}
++
++SlotCacheStats SlotCache::stats() const noexcept {
++    std::lock_guard<std::mutex> lock(mutex_);
++    SlotCacheStats result;
++    result.capacity_slots = slots_.size();
++    result.bytes_per_slot = options_.bytes_per_slot;
++    result.configured_capacity_bytes = configured_capacity_bytes_;
++    result.byte_budget = options_.byte_budget;
++    result.metadata_bytes = slots_.capacity() * sizeof(Slot);
++    result.active_reservations = active_reservations_;
++    result.active_completion_tokens = token_slots_.size();
++    for (const Slot & slot : slots_) {
++        if (slot.state == State::Resident) {
++            ++result.resident_slots;
++        } else if (slot.state == State::Reserved) {
++            ++result.reserved_slots;
++        }
++        if (slot.gpu_use_refs != 0) {
++            ++result.pinned_slots;
++        }
++    }
++    return result;
++}
++
++}  // namespace ps5lm::moe
+diff --git a/src/slot_cache.hpp b/src/slot_cache.hpp
+new file mode 100644
+index 0000000..9164a32
+--- /dev/null
++++ b/src/slot_cache.hpp
+@@ -0,0 +1,190 @@
++// Backend-independent transactional slot policy for MoE expert paging.
++// SPDX-License-Identifier: GPL-3.0-or-later
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <map>
++#include <mutex>
++#include <vector>
++
++namespace ps5lm::moe {
++
++struct ExpertKey {
++    std::uint32_t layer = 0;
++    std::uint32_t expert = 0;
++
++    friend bool operator==(ExpertKey a, ExpertKey b) noexcept {
++        return a.layer == b.layer && a.expert == b.expert;
++    }
++    friend bool operator!=(ExpertKey a, ExpertKey b) noexcept { return !(a == b); }
++};
++
++using CompletionToken = std::uint64_t;
++constexpr std::size_t kNoSlot = static_cast<std::size_t>(-1);
++
++enum class SlotCacheStatus : std::uint8_t {
++    Ok,
++    InvalidConfiguration,
++    BudgetExceeded,
++    TooManySlots,
++    OutOfMemory,
++    InvalidRequest,
++    RequestTooLarge,
++    TooManyUniqueExperts,
++    TooManyOutstandingBatches,
++    KeyReserved,
++    InsufficientUnpinnedSlots,
++    InvalidReservation,
++    UploadNotRequired,
++    UploadsIncomplete,
++    InvalidCompletionToken,
++    TooManyInFlightTokens,
++    UnknownCompletionToken,
++    InternalError,
++};
++
++const char * slot_cache_status_name(SlotCacheStatus status) noexcept;
++
++struct SlotCacheOptions {
++    std::size_t slot_count = 0;
++    std::size_t bytes_per_slot = 0;
++    std::size_t byte_budget = 0;
++    std::size_t max_in_flight_tokens = 16;
++    std::size_t max_request_keys = 4096;
++};
++
++// One entry for each distinct requested identity. Repeated request IDs resolve
++// through slot_for() to this same assignment and never consume extra slots.
++struct SlotAssignment {
++    ExpertKey key{};
++    std::size_t slot = kNoSlot;
++    bool needs_upload = false;
++    bool upload_complete = false;
++};
++
++struct SlotCacheStats {
++    std::size_t capacity_slots = 0;
++    std::size_t resident_slots = 0;
++    std::size_t reserved_slots = 0;
++    std::size_t pinned_slots = 0;
++    std::size_t active_reservations = 0;
++    std::size_t active_completion_tokens = 0;
++    std::size_t bytes_per_slot = 0;
++    std::size_t configured_capacity_bytes = 0;
++    std::size_t byte_budget = 0;
++    std::size_t metadata_bytes = 0;
++};
++
++struct SlotView {
++    bool resident = false;
++    bool reserved = false;
++    ExpertKey key{};  // resident key or pending reservation key
++    std::size_t outstanding_reservations = 0;
++    std::size_t outstanding_gpu_uses = 0;
++};
++
++class SlotCache;
++
++class Reservation final {
++public:
++    Reservation() noexcept = default;
++    ~Reservation() noexcept;
++    Reservation(const Reservation &) = delete;
++    Reservation & operator=(const Reservation &) = delete;
++    Reservation(Reservation && other) noexcept;
++    Reservation & operator=(Reservation && other) noexcept;
++
++    bool active() const noexcept { return active_; }
++    const std::vector<SlotAssignment> & assignments() const noexcept { return assignments_; }
++    bool slot_for(ExpertKey key, std::size_t * slot_out) const noexcept;
++
++    // Call only after that key's read and upload have both completed. It is
++    // idempotent for a key that was already marked complete.
++    SlotCacheStatus mark_upload_complete(ExpertKey key) noexcept;
++
++    // Atomically publishes every newly uploaded key and pins all batch slots
++    // to this unique, monotonically increasing future GPU completion token.
++    // Uploads incomplete leaves the reservation active so the caller can
++    // finish or roll it back.
++    SlotCacheStatus commit(CompletionToken token) noexcept;
++
++    // Cancellation, read failure, or upload failure invalidates all pending
++    // slots and releases hit reservations. The handle's destructor rolls back
++    // an active reservation automatically.
++    void rollback() noexcept;
++
++private:
++    friend class SlotCache;
++    Reservation(SlotCache * owner, std::uint64_t id, std::vector<SlotAssignment> assignments) noexcept;
++
++    SlotCache * owner_ = nullptr;  // SlotCache must outlive its reservations
++    std::uint64_t id_ = 0;
++    bool active_ = false;
++    std::vector<SlotAssignment> assignments_;
++};
++
++struct ReserveResult {
++    SlotCacheStatus status = SlotCacheStatus::InvalidRequest;
++    Reservation reservation;
++    bool ok() const noexcept { return status == SlotCacheStatus::Ok && reservation.active(); }
++};
++
++class SlotCache final {
++public:
++    static constexpr std::size_t kHardSlotLimit = 4096;
++    static constexpr std::size_t kHardRequestKeyLimit = 4096;
++    static constexpr std::size_t kHardInFlightLimit = 256;
++
++    explicit SlotCache(const SlotCacheOptions & options) noexcept;
++    ~SlotCache() noexcept = default;
++    SlotCache(const SlotCache &) = delete;
++    SlotCache & operator=(const SlotCache &) = delete;
++
++    SlotCacheStatus configuration_status() const noexcept { return configuration_status_; }
++    std::size_t slot_count() const noexcept { return slots_.size(); }
++
++    // Reservation is all-or-nothing. It deduplicates repeated identities,
++    // protects hits and reserves enough empty/LRU-unpinned slots for every miss.
++    ReserveResult reserve(const std::vector<ExpertKey> & requested);
++
++    // Completes a fake/real timeline token. Only this operation releases the
++    // corresponding GPU-use pins. Unknown and repeated completion signals fail.
++    SlotCacheStatus complete(CompletionToken token) noexcept;
++
++    bool find_slot(ExpertKey key, std::size_t * slot_out) const noexcept;
++    bool inspect_slot(std::size_t index, SlotView * view_out) const noexcept;
++    SlotCacheStats stats() const noexcept;
++
++private:
++    friend class Reservation;
++
++    enum class State : std::uint8_t { Empty, Resident, Reserved };
++    struct Slot {
++        State state = State::Empty;
++        ExpertKey key{};
++        std::size_t reservation_refs = 0;
++        std::size_t gpu_use_refs = 0;
++        std::uint64_t pending_transaction = 0;
++        std::uint64_t last_use = 0;
++    };
++
++    SlotCacheStatus commit(Reservation & reservation, CompletionToken token) noexcept;
++    void rollback(Reservation & reservation) noexcept;
++    std::size_t find_resident_locked(ExpertKey key) const noexcept;
++    std::size_t find_reserved_locked(ExpertKey key) const noexcept;
++    std::uint64_t next_lru_stamp() noexcept;
++
++    mutable std::mutex mutex_;
++    std::vector<Slot> slots_;
++    std::map<CompletionToken, std::vector<std::size_t>> token_slots_;
++    SlotCacheOptions options_{};
++    SlotCacheStatus configuration_status_ = SlotCacheStatus::InvalidConfiguration;
++    std::size_t configured_capacity_bytes_ = 0;
++    std::size_t active_reservations_ = 0;
++    std::uint64_t next_transaction_id_ = 1;
++    std::uint64_t last_completion_token_ = 0;
++    std::uint64_t lru_clock_ = 0;
++};
++
++}  // namespace ps5lm::moe
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 1a9bc91..33c9547 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -316,7 +316,12 @@ endif()
+ llama_build(test-backend-ops.cpp LINK ggml)
+ 
+ llama_build_and_test(test-tiled-mulmat.cpp LINK ggml)
++llama_build_and_test(test-backend-sched-copy-callback.cpp LINK ggml)
+ llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
++if (NOT WIN32)
++    llama_build_and_test(test-moe-paged-loader.cpp LABEL "model" LINK llama)
++    llama_build_and_test(test-moe-paging-inference.cpp LABEL "model" LINK llama)
++endif()
+ llama_build_and_test(test-autorelease.cpp       LABEL "model")
+ llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
+ 
+diff --git a/tests/test-backend-sched-copy-callback.cpp b/tests/test-backend-sched-copy-callback.cpp
+new file mode 100644
+index 0000000..ab34520
+--- /dev/null
++++ b/tests/test-backend-sched-copy-callback.cpp
+@@ -0,0 +1,197 @@
++#include "ggml.h"
++#include "ggml-backend.h"
++#include "../ggml/src/ggml-backend-impl.h"
++#include "ggml-cpu.h"
++
++#include <cstdio>
++#include <memory>
++
++struct backend_deleter {
++    void operator()(ggml_backend * backend) const {
++        ggml_backend_free(backend);
++    }
++};
++
++struct buffer_deleter {
++    void operator()(ggml_backend_buffer * buffer) const {
++        ggml_backend_buffer_free(buffer);
++    }
++};
++
++struct context_deleter {
++    void operator()(ggml_context * context) const {
++        ggml_free(context);
++    }
++};
++
++using backend_ptr = std::unique_ptr<ggml_backend, backend_deleter>;
++using buffer_ptr = std::unique_ptr<ggml_backend_buffer, buffer_deleter>;
++using context_ptr = std::unique_ptr<ggml_context, context_deleter>;
++
++enum copy_mode {
++    COPY_LEGACY_NOT_HANDLED,
++    COPY_LEGACY_HANDLED,
++    COPY_V2_NOT_HANDLED,
++    COPY_V2_HANDLED,
++    COPY_V2_ERROR,
++};
++
++struct callback_data {
++    copy_mode mode;
++    int calls;
++};
++
++static void write_custom_weight(ggml_tensor * dst) {
++    const float values[] = { 10.0f, 11.0f, 12.0f, 13.0f };
++    ggml_backend_tensor_set(dst, values, 0, sizeof(values));
++}
++
++static bool copy_callback_legacy(ggml_backend_t, const ggml_tensor *, ggml_tensor * dst, ggml_cgraph *, void * user_data) {
++    callback_data * data = (callback_data *) user_data;
++    data->calls++;
++    if (data->mode == COPY_LEGACY_HANDLED) {
++        write_custom_weight(dst);
++        return true;
++    }
++    return false;
++}
++
++static ggml_backend_sched_copy_result copy_callback_v2(ggml_backend_t, const ggml_tensor *, ggml_tensor * dst, ggml_cgraph *, void * user_data) {
++    callback_data * data = (callback_data *) user_data;
++    data->calls++;
++    switch (data->mode) {
++        case COPY_V2_NOT_HANDLED:
++            return GGML_BACKEND_SCHED_COPY_NOT_HANDLED;
++        case COPY_V2_HANDLED:
++            write_custom_weight(dst);
++            return GGML_BACKEND_SCHED_COPY_HANDLED;
++        case COPY_V2_ERROR:
++            return GGML_BACKEND_SCHED_COPY_ERROR;
++        default:
++            return GGML_BACKEND_SCHED_COPY_ERROR;
++    }
++}
++
++static ggml_backend_buffer_type custom_buft;
++
++static bool custom_supports_buft(ggml_backend_dev_t, ggml_backend_buffer_type_t buft) {
++    return buft == &custom_buft;
++}
++
++static ggml_backend_buffer_type_t custom_get_buffer_type(ggml_backend_dev_t) {
++    return &custom_buft;
++}
++
++static bool run_case(copy_mode mode) {
++    backend_ptr backend_a(ggml_backend_cpu_init());
++    backend_ptr backend_b(ggml_backend_cpu_init());
++    if (!backend_a || !backend_b) {
++        return false;
++    }
++
++    custom_buft = *ggml_backend_cpu_buffer_type();
++    struct ggml_backend_device custom_dev = *backend_b->device;
++    custom_dev.iface.supports_buft = custom_supports_buft;
++    custom_dev.iface.get_buffer_type = custom_get_buffer_type;
++    custom_buft.device = &custom_dev;
++    backend_b->device = &custom_dev;
++
++    ggml_init_params params = { 1024 * 1024, NULL, true };
++    context_ptr ctx_input(ggml_init(params));
++    context_ptr ctx_weight(ggml_init(params));
++    context_ptr ctx_graph(ggml_init(params));
++    if (!ctx_input || !ctx_weight || !ctx_graph) {
++        return false;
++    }
++
++    ggml_tensor * input = ggml_new_tensor_1d(ctx_input.get(), GGML_TYPE_F32, 4);
++    ggml_tensor * weight = ggml_new_tensor_1d(ctx_weight.get(), GGML_TYPE_F32, 4);
++    buffer_ptr input_buffer(ggml_backend_alloc_ctx_tensors(ctx_input.get(), backend_a.get()));
++    buffer_ptr weight_buffer(ggml_backend_alloc_ctx_tensors(ctx_weight.get(), backend_a.get()));
++    if (!input_buffer || !weight_buffer) {
++        return false;
++    }
++    ggml_backend_buffer_set_usage(weight_buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++
++    const float input_values[] = { 1.0f, 1.0f, 1.0f, 1.0f };
++    const float weight_values[] = { 2.0f, 3.0f, 4.0f, 5.0f };
++    ggml_backend_tensor_set(input, input_values, 0, sizeof(input_values));
++    ggml_backend_tensor_set(weight, weight_values, 0, sizeof(weight_values));
++
++    ggml_tensor * prior = ggml_scale(ctx_graph.get(), input, 3.0f);
++    ggml_tensor * first = ggml_add(ctx_graph.get(), prior, weight);
++    ggml_tensor * second = ggml_scale(ctx_graph.get(), first, 2.0f);
++    ggml_set_output(second);
++    ggml_cgraph * graph = ggml_new_graph(ctx_graph.get());
++    ggml_build_forward_expand(graph, second);
++
++    ggml_backend_t backends[] = { backend_a.get(), backend_b.get() };
++    ggml_backend_buffer_type_t bufts[] = {
++        ggml_backend_cpu_buffer_type(),
++        &custom_buft,
++    };
++    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, bufts, 2, 16, false, false);
++    ggml_backend_sched_set_tensor_backend(sched, input, backend_a.get());
++    ggml_backend_sched_set_tensor_backend(sched, weight, backend_a.get());
++    ggml_backend_sched_set_tensor_backend(sched, prior, backend_a.get());
++    ggml_backend_sched_set_tensor_backend(sched, first, backend_b.get());
++    ggml_backend_sched_set_tensor_backend(sched, second, backend_a.get());
++
++    callback_data data = { mode, 0 };
++    if (mode == COPY_LEGACY_NOT_HANDLED || mode == COPY_LEGACY_HANDLED) {
++        ggml_backend_sched_set_copy_callback(sched, copy_callback_legacy, &data);
++    } else {
++        ggml_backend_sched_set_copy_callback_v2(sched, copy_callback_v2, &data);
++    }
++
++    bool ok = ggml_backend_sched_alloc_graph(sched, graph) && ggml_backend_sched_get_n_splits(sched) == 3;
++    if (ok && mode == COPY_V2_ERROR) {
++        ok = (ggml_backend_sched_graph_compute_async(sched, graph) == GGML_STATUS_FAILED);
++        float first_result[4];
++        float second_result[4];
++        float prior_result[4];
++        ggml_backend_tensor_get(prior, prior_result, 0, sizeof(prior_result));
++        ggml_backend_tensor_get(first, first_result, 0, sizeof(first_result));
++        ggml_backend_tensor_get(second, second_result, 0, sizeof(second_result));
++        for (int i = 0; i < 4; i++) {
++            const float computed_first = (input_values[i] * 3.0f + weight_values[i]);
++            const float computed_second = computed_first * 2.0f;
++            ok = ok && prior_result[i] == input_values[i] * 3.0f &&
++                first_result[i] != computed_first && second_result[i] != computed_second;
++        }
++    } else if (ok) {
++        ok = (ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
++        const float expected_weight[] = {
++            mode == COPY_LEGACY_HANDLED || mode == COPY_V2_HANDLED ? 10.0f : 2.0f,
++            mode == COPY_LEGACY_HANDLED || mode == COPY_V2_HANDLED ? 11.0f : 3.0f,
++            mode == COPY_LEGACY_HANDLED || mode == COPY_V2_HANDLED ? 12.0f : 4.0f,
++            mode == COPY_LEGACY_HANDLED || mode == COPY_V2_HANDLED ? 13.0f : 5.0f,
++        };
++        float result[4];
++        ggml_backend_tensor_get(second, result, 0, sizeof(result));
++        for (int i = 0; i < 4; i++) {
++            ok = ok && result[i] == (input_values[i] * 3.0f + expected_weight[i]) * 2.0f;
++        }
++    }
++
++    ok = ok && data.calls == 1;
++    ggml_backend_sched_free(sched);
++    return ok;
++}
++
++int main() {
++    const copy_mode modes[] = {
++        COPY_LEGACY_NOT_HANDLED,
++        COPY_LEGACY_HANDLED,
++        COPY_V2_NOT_HANDLED,
++        COPY_V2_HANDLED,
++        COPY_V2_ERROR,
++    };
++    for (copy_mode mode : modes) {
++        if (!run_case(mode)) {
++            std::fprintf(stderr, "scheduler copy callback test failed for mode %d\n", (int) mode);
++            return 1;
++        }
++    }
++    return 0;
++}
+diff --git a/tests/test-moe-paged-loader.cpp b/tests/test-moe-paged-loader.cpp
+new file mode 100644
+index 0000000..ab5d1a4
+--- /dev/null
++++ b/tests/test-moe-paged-loader.cpp
+@@ -0,0 +1,303 @@
++#include "../src/llama-model-loader.h"
++#include "../src/llama-model.h"
++
++#include "gguf.h"
++#include "llama.h"
++
++#include <algorithm>
++#include <array>
++#include <cerrno>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fcntl.h>
++#include <stdexcept>
++#include <string>
++#include <unistd.h>
++#include <utility>
++#include <vector>
++
++static void require(bool condition, const char * message) {
++    if (!condition) {
++        throw std::runtime_error(message);
++    }
++}
++
++struct temp_file {
++    std::string path;
++
++    temp_file() {
++        std::array<char, 64> name{};
++        std::strcpy(name.data(), "/tmp/llama-moe-paged-XXXXXX");
++        const int fd = mkstemp(name.data());
++        if (fd < 0) {
++            throw std::runtime_error("mkstemp failed");
++        }
++        close(fd);
++        path = name.data();
++    }
++
++    temp_file(const temp_file &) = delete;
++    temp_file & operator=(const temp_file &) = delete;
++
++    temp_file(temp_file && other) noexcept : path(std::move(other.path)) {
++        other.path.clear();
++    }
++
++    ~temp_file() {
++        if (!path.empty()) {
++            unlink(path.c_str());
++        }
++    }
++};
++
++static void add_tensor(gguf_context * gguf, ggml_tensor * tensor) {
++    gguf_add_tensor(gguf, tensor);
++    gguf_set_tensor_data(gguf, tensor->name, tensor->data);
++}
++
++static temp_file make_fixture(const char * architecture, bool split) {
++    temp_file file;
++
++    ggml_init_params init{};
++    init.mem_size = 1 << 20;
++    ggml_context * tensors = ggml_init(init);
++    require(tensors != nullptr, "ggml_init failed");
++
++    auto * gate = ggml_new_tensor_3d(tensors, GGML_TYPE_F32, 4, 4, 2);
++    auto * up   = ggml_new_tensor_3d(tensors, GGML_TYPE_F32, 4, 4, 2);
++    auto * down = ggml_new_tensor_3d(tensors, GGML_TYPE_F32, 4, 4, 2);
++    auto * norm = ggml_new_tensor_1d(tensors, GGML_TYPE_F32, 4);
++    require(gate && up && down && norm, "synthetic tensors allocation failed");
++
++    ggml_set_name(gate, "blk.0.ffn_gate_exps.weight");
++    ggml_set_name(up,   "blk.0.ffn_up_exps.weight");
++    ggml_set_name(down, "blk.0.ffn_down_exps.weight");
++    ggml_set_name(norm, "blk.0.attn_norm.weight");
++    std::memset(gate->data, 0x11, ggml_nbytes(gate));
++    std::memset(up->data,   0x22, ggml_nbytes(up));
++    std::memset(down->data, 0x33, ggml_nbytes(down));
++    std::memset(norm->data, 0x44, ggml_nbytes(norm));
++
++    gguf_context * gguf = gguf_init_empty();
++    require(gguf != nullptr, "gguf_init_empty failed");
++    gguf_set_val_str(gguf, "general.architecture", architecture);
++    if (split) {
++        gguf_set_val_u16(gguf, "split.count", 2);
++    }
++    add_tensor(gguf, gate);
++    add_tensor(gguf, up);
++    add_tensor(gguf, down);
++    add_tensor(gguf, norm);
++
++    const bool wrote = gguf_write_to_file(gguf, file.path.c_str(), false);
++    gguf_free(gguf);
++    ggml_free(tensors);
++    require(wrote, "writing synthetic GGUF failed");
++    return file;
++}
++
++static int open_fd_count() {
++    long limit = sysconf(_SC_OPEN_MAX);
++    if (limit <= 0) {
++        limit = 1024;
++    }
++    limit = std::min<long>(limit, 4096);
++    int count = 0;
++    for (int fd = 0; fd < limit; ++fd) {
++        if (fcntl(fd, F_GETFD) >= 0) {
++            ++count;
++        }
++    }
++    return count;
++}
++
++static void test_metadata_only_expert_plan() {
++    auto file = make_fixture("qwen3moe", false);
++    std::vector<std::string> splits;
++
++    auto * cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++    require(cpu != nullptr, "CPU backend not available");
++    const buft_list_t cpu_buft{{cpu, ggml_backend_dev_buffer_type(cpu)}};
++
++    {
++        llama_model_loader loader(nullptr, nullptr, nullptr, file.path, splits, nullptr,
++                LLAMA_LOAD_MODE_NONE, false, false, false, true, nullptr, nullptr);
++
++        llama_hparams hparams{};
++        hparams.n_expert = 2;
++        hparams.n_layer_all = 1;
++        const LLM_TN tn(LLM_ARCH_QWEN3MOE);
++
++        require(loader.create_tensor(hparams, &cpu_buft, &cpu_buft, &cpu_buft, &cpu_buft,
++                    tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", 0), {4, 4, 2}, 0) != nullptr,
++                "gate expert tensor metadata creation failed");
++        require(loader.create_tensor(hparams, &cpu_buft, &cpu_buft, &cpu_buft, &cpu_buft,
++                    tn(LLM_TENSOR_FFN_UP_EXPS, "weight", 0), {4, 4, 2}, 0) != nullptr,
++                "up expert tensor metadata creation failed");
++        require(loader.create_tensor(hparams, &cpu_buft, &cpu_buft, &cpu_buft, &cpu_buft,
++                    tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", 0), {4, 4, 2}, 0) != nullptr,
++                "down expert tensor metadata creation failed");
++        require(loader.create_tensor(hparams, &cpu_buft, &cpu_buft, &cpu_buft, &cpu_buft,
++                    tn(LLM_TENSOR_ATTN_NORM, "weight", 0), {4}, 0) != nullptr,
++                "dense tensor metadata creation failed");
++        loader.done_getting_tensors();
++
++        require(loader.paged_expert_descriptors.size() == 3, "expected three expert descriptors");
++        require(loader.paged_expert_tensor_ids.size() == 3, "expected three expert tensor IDs");
++
++        std::size_t paged_tensor_count = 0;
++        for (const auto & entry : loader.ctx_map) {
++            if (!entry.first.paged) {
++                continue;
++            }
++            for (ggml_tensor * tensor = ggml_get_first_tensor(entry.second.get()); tensor;
++                    tensor = ggml_get_next_tensor(entry.second.get(), tensor)) {
++                require(tensor->data == nullptr, "expert metadata unexpectedly owns a tensor-sized payload");
++                ++paged_tensor_count;
++            }
++        }
++        require(paged_tensor_count == 3, "all experts must occupy the paged context");
++
++        loader.init_mappings();
++        require(loader.mappings.empty(), "page mode must not mmap any model file");
++        require(loader.size_data == sizeof(float) * 4, "ordinary load byte budget must exclude all expert payloads");
++        require(loader.size_done == 0, "metadata planning must not account any expert payload as loaded");
++
++        auto opened = loader.open_paged_expert_source(1024);
++        require(opened.ok(), "opening the synthetic expert source failed");
++        require(opened.source->tensor_count() == 3, "source must retain only three expert descriptors");
++        require(loader.size_done == 0, "opening the source must not read expert payloads");
++    }
++}
++
++static void test_rejected_split_closes_file() {
++    auto file = make_fixture("qwen3moe", true);
++    std::vector<std::string> splits;
++    const int before = open_fd_count();
++    bool rejected = false;
++    try {
++        llama_model_loader loader(nullptr, nullptr, nullptr, file.path, splits, nullptr,
++                LLAMA_LOAD_MODE_NONE, false, false, false, true, nullptr, nullptr);
++    } catch (const std::exception & e) {
++        rejected = std::string(e.what()).find("split GGUF") != std::string::npos;
++    }
++    require(rejected, "split GGUF paging request must fail explicitly");
++    require(open_fd_count() == before, "failed split load leaked an open shard descriptor");
++}
++
++static void test_public_model_load_fails_closed() {
++    auto file = make_fixture("qwen3moe", false);
++    auto params = llama_model_default_params();
++    params.use_moe_expert_paging = true;
++    params.load_mode = LLAMA_LOAD_MODE_NONE;
++    params.split_mode = LLAMA_SPLIT_MODE_NONE;
++    params.lazy_mode = LLAMA_LAZY_MODE_OFF;
++    params.use_extra_bufts = false;
++    require(llama_model_load_from_file(file.path.c_str(), params) == nullptr,
++            "incomplete synthetic Qwen3MoE load must fail before returning a model");
++}
++
++static std::string find_fixture_path(const std::string & rel_path) {
++    const char * env_path = std::getenv("PS5LM_FIXTURE_PATH");
++    if (env_path && access(env_path, R_OK) == 0) {
++        return env_path;
++    }
++    const std::vector<std::string> prefixes = {
++        "",
++        "./",
++        "../",
++        "../../",
++        "../../../",
++        "../../../../",
++    };
++    for (const auto & p : prefixes) {
++        std::string cand = p + rel_path;
++        if (access(cand.c_str(), R_OK) == 0) {
++            return cand;
++        }
++    }
++    return "";
++}
++
++static void test_qwen3moe_tiny_fixture_loader() {
++    const std::string fixture_path = find_fixture_path("tests/fixtures/moe_paging/qwen3moe-tiny-f32.gguf");
++    if (fixture_path.empty()) {
++        std::fprintf(stderr, "warning: qwen3moe-tiny-f32.gguf fixture not found, skipping fixture loader test\n");
++        return;
++    }
++
++    auto params_res = llama_model_default_params();
++    params_res.use_moe_expert_paging = false;
++    params_res.use_extra_bufts = false;
++    llama_model * model_res = llama_model_load_from_file(fixture_path.c_str(), params_res);
++    require(model_res != nullptr, "resident tiny model load failed");
++
++    auto params_paged = llama_model_default_params();
++    params_paged.use_moe_expert_paging = true;
++    params_paged.use_extra_bufts = false;
++    llama_model * model_paged = llama_model_load_from_file(fixture_path.c_str(), params_paged);
++    require(model_paged != nullptr, "paged tiny model load failed");
++    require(model_paged->has_paged_experts, "has_paged_experts must be true");
++
++    const auto * source = model_paged->paged_expert_source();
++    require(source != nullptr, "paged_expert_source() must not be null");
++
++    const int n_layer = model_paged->hparams.n_layer();
++    const int n_expert = model_paged->hparams.n_expert;
++    require(n_layer > 0 && n_expert > 0, "invalid model dimensions");
++
++    for (int il = 0; il < n_layer; ++il) {
++        const auto & layer_res = model_res->layers[il];
++        const auto & layer_paged = model_paged->layers[il];
++
++        const std::pair<const ggml_tensor *, const ggml_tensor *> pairs[] = {
++            {layer_res.ffn_gate_exps, layer_paged.ffn_gate_exps},
++            {layer_res.ffn_up_exps,   layer_paged.ffn_up_exps},
++            {layer_res.ffn_down_exps, layer_paged.ffn_down_exps},
++        };
++
++        for (const auto & [t_res, t_paged] : pairs) {
++            require(t_res != nullptr, "resident expert tensor missing");
++            require(t_paged != nullptr, "paged expert tensor missing");
++            require(t_res->data != nullptr, "resident expert tensor must have data");
++            require(t_paged->data == nullptr, "paged expert tensor must NOT have resident data");
++            require(ggml_backend_buffer_get_size(t_paged->buffer) == 0, "paged expert tensor buffer size must be 0");
++
++            uint64_t tensor_id = 0;
++            require(model_paged->paged_expert_tensor_id(t_paged, &tensor_id), "paged_expert_tensor_id lookup failed");
++            require(tensor_id > 0, "tensor_id must be non-zero");
++
++            const size_t slice_bytes = static_cast<size_t>(t_paged->nb[2]);
++            std::vector<uint8_t> slice_buf(slice_bytes);
++
++            for (int e = 0; e < n_expert; ++e) {
++                const auto read_err = source->read_expert(tensor_id, e, slice_buf.data(), slice_bytes);
++                require(read_err.ok(), "read_expert failed");
++
++                const uint8_t * res_ptr = static_cast<const uint8_t *>(t_res->data) + e * t_res->nb[2];
++                require(std::memcmp(slice_buf.data(), res_ptr, slice_bytes) == 0, "paged expert slice byte mismatch");
++            }
++        }
++    }
++
++    llama_model_free(model_res);
++    llama_model_free(model_paged);
++}
++
++int main() {
++    try {
++        llama_backend_init();
++        test_metadata_only_expert_plan();
++        test_rejected_split_closes_file();
++        test_public_model_load_fails_closed();
++        test_qwen3moe_tiny_fixture_loader();
++        llama_backend_free();
++    } catch (const std::exception & e) {
++        std::fprintf(stderr, "test-moe-paged-loader: %s\n", e.what());
++        llama_backend_free();
++        return 1;
++    }
++    std::fprintf(stderr, "test-moe-paged-loader: passed\n");
++    return 0;
++}
+diff --git a/tests/test-moe-paging-inference.cpp b/tests/test-moe-paging-inference.cpp
+new file mode 100644
+index 0000000..46bfe78
+--- /dev/null
++++ b/tests/test-moe-paging-inference.cpp
+@@ -0,0 +1,494 @@
++// Integration test for Qwen3MoE Non-Resident Expert Paging & Inference Parity.
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#include "llama.h"
++#include "../src/llama-model.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <initializer_list>
++#include <limits>
++#include <stdexcept>
++#include <string>
++#include <unistd.h>
++#include <vector>
++
++static void llama_batch_clear(struct llama_batch & batch) {
++    batch.n_tokens = 0;
++}
++
++static void llama_batch_add(
++        struct llama_batch & batch,
++        llama_token id,
++        llama_pos pos,
++        std::initializer_list<llama_seq_id> seq_ids,
++        bool logits) {
++    const int32_t idx = batch.n_tokens;
++    batch.token   [idx] = id;
++    batch.pos     [idx] = pos;
++    batch.n_seq_id[idx] = seq_ids.size();
++    size_t i = 0;
++    for (llama_seq_id sid : seq_ids) {
++        batch.seq_id[idx][i++] = sid;
++    }
++    batch.logits  [idx] = logits;
++    batch.n_tokens++;
++}
++
++static void require(bool condition, const char * message) {
++    if (!condition) {
++        throw std::runtime_error(message);
++    }
++}
++
++static std::string find_fixture_path(const std::string & rel_path) {
++    const char * env_path = std::getenv("PS5LM_FIXTURE_PATH");
++    if (env_path && access(env_path, R_OK) == 0) {
++        return env_path;
++    }
++    const std::vector<std::string> prefixes = {
++        "",
++        "./",
++        "../",
++        "../../",
++        "../../../",
++        "../../../../",
++    };
++    for (const auto & p : prefixes) {
++        std::string cand = p + rel_path;
++        if (access(cand.c_str(), R_OK) == 0) {
++            return cand;
++        }
++    }
++    return "";
++}
++
++static void assert_logits_parity(const std::vector<float> & a, const std::vector<float> & b, float tol = 1e-5f) {
++    require(a.size() == b.size(), "logits dimension mismatch");
++    float max_diff = 0.0f;
++    for (size_t i = 0; i < a.size(); ++i) {
++        float diff = std::fabs(a[i] - b[i]);
++        if (diff > max_diff) {
++            max_diff = diff;
++        }
++    }
++    if (max_diff >= tol) {
++        char buf[256];
++        std::snprintf(buf, sizeof(buf), "logits parity violated: max diff %g >= %g", max_diff, tol);
++        throw std::runtime_error(buf);
++    }
++}
++
++static std::vector<float> run_eval_sequence(
++        llama_model * model,
++        llama_context_params cparams,
++        const std::vector<llama_token> & tokens,
++        int n_decode_steps = 0) {
++    llama_context * ctx = llama_init_from_model(model, cparams);
++    require(ctx != nullptr, "failed to create context for eval");
++
++    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
++    std::vector<float> result_logits;
++
++    // Prefill tokens
++    llama_batch batch = llama_batch_init(tokens.size() + n_decode_steps, 0, 1);
++    for (size_t i = 0; i < tokens.size(); ++i) {
++        llama_batch_add(batch, tokens[i], i, { 0 }, i == tokens.size() - 1);
++    }
++    int ret = llama_decode(ctx, batch);
++    require(ret == 0, "prefill llama_decode failed");
++
++    float * logits = llama_get_logits_ith(ctx, -1);
++    require(logits != nullptr, "null logits after prefill");
++    result_logits.assign(logits, logits + n_vocab);
++
++    // Subsequent single-token decode steps
++    for (int step = 0; step < n_decode_steps; ++step) {
++        llama_token next_token = 0;
++        float max_logit = -std::numeric_limits<float>::infinity();
++        for (int v = 0; v < n_vocab; ++v) {
++            if (logits[v] > max_logit) {
++                max_logit = logits[v];
++                next_token = v;
++            }
++        }
++
++        llama_batch_clear(batch);
++        llama_batch_add(batch, next_token, tokens.size() + step, { 0 }, true);
++
++        ret = llama_decode(ctx, batch);
++        require(ret == 0, "decode step failed");
++
++        logits = llama_get_logits_ith(ctx, -1);
++        require(logits != nullptr, "null logits in decode step");
++        result_logits.insert(result_logits.end(), logits, logits + n_vocab);
++    }
++
++    llama_batch_free(batch);
++    llama_free(ctx);
++    return result_logits;
++}
++
++static void test_context_validation_and_budget_floor(const std::string & fixture_path) {
++    auto mparams = llama_model_default_params();
++    mparams.use_moe_expert_paging = true;
++    mparams.use_extra_bufts = false;
++    llama_model * model = llama_model_load_from_file(fixture_path.c_str(), mparams);
++    require(model != nullptr, "paged model load failed");
++    require(model->has_paged_experts, "has_paged_experts must be true");
++
++    // 1. n_ubatch > 1 must fail closed
++    {
++        auto cparams = llama_context_default_params();
++        cparams.n_ubatch = 2;
++        cparams.n_seq_max = 1;
++        cparams.moe_cache_size = 64 * 1024 * 1024;
++        llama_context * ctx = llama_init_from_model(model, cparams);
++        if (ctx) { llama_free(ctx); }
++        require(ctx == nullptr, "must fail closed when n_ubatch > 1");
++    }
++
++    // 2. n_seq_max > 1 must fail closed
++    {
++        auto cparams = llama_context_default_params();
++        cparams.n_ubatch = 1;
++        cparams.n_seq_max = 2;
++        cparams.moe_cache_size = 64 * 1024 * 1024;
++        llama_context * ctx = llama_init_from_model(model, cparams);
++        if (ctx) { llama_free(ctx); }
++        require(ctx == nullptr, "must fail closed when n_seq_max > 1");
++    }
++
++    // 3. moe_cache_size == 0 must fail closed
++    {
++        auto cparams = llama_context_default_params();
++        cparams.n_ubatch = 1;
++        cparams.n_seq_max = 1;
++        cparams.moe_cache_size = 0;
++        llama_context * ctx = llama_init_from_model(model, cparams);
++        if (ctx) { llama_free(ctx); }
++        require(ctx == nullptr, "must fail closed when moe_cache_size == 0");
++    }
++
++    // 4. embeddings == true must fail closed
++    {
++        auto cparams = llama_context_default_params();
++        cparams.n_ubatch = 1;
++        cparams.n_seq_max = 1;
++        cparams.moe_cache_size = 64 * 1024 * 1024;
++        cparams.embeddings = true;
++        llama_context * ctx = llama_init_from_model(model, cparams);
++        if (ctx) { llama_free(ctx); }
++        require(ctx == nullptr, "must fail closed when embeddings == true");
++    }
++
++    // 5. causal_attn == false must fail closed
++    {
++        auto cparams = llama_context_default_params();
++        cparams.n_ubatch = 1;
++        cparams.n_seq_max = 1;
++        cparams.moe_cache_size = 64 * 1024 * 1024;
++        cparams.attention_type = LLAMA_ATTENTION_TYPE_NON_CAUSAL;
++        llama_context * ctx = llama_init_from_model(model, cparams);
++        if (ctx) { llama_free(ctx); }
++        require(ctx == nullptr, "must fail closed when causal_attn == false");
++    }
++
++    // 6. moe_cache_size < budget_floor must fail closed
++    {
++        auto cparams = llama_context_default_params();
++        cparams.n_ubatch = 1;
++        cparams.n_seq_max = 1;
++        cparams.moe_cache_size = 512; // Far below minimum budget floor
++        llama_context * ctx = llama_init_from_model(model, cparams);
++        if (ctx) { llama_free(ctx); }
++        require(ctx == nullptr, "must fail closed when moe_cache_size < budget_floor");
++    }
++
++    // 7. Valid parameters must succeed
++    {
++        auto cparams = llama_context_default_params();
++        cparams.n_ubatch = 1;
++        cparams.n_seq_max = 1;
++        cparams.moe_cache_size = 64 * 1024 * 1024;
++        llama_context * ctx = llama_init_from_model(model, cparams);
++        require(ctx != nullptr, "valid paged context initialization failed");
++        llama_free(ctx);
++    }
++
++    llama_model_free(model);
++}
++
++static void test_prefill_and_decode_parity(const std::string & fixture_path) {
++    auto mparams_res = llama_model_default_params();
++    mparams_res.use_moe_expert_paging = false;
++    mparams_res.use_extra_bufts = false;
++    llama_model * model_res = llama_model_load_from_file(fixture_path.c_str(), mparams_res);
++    require(model_res != nullptr, "resident model load failed");
++
++    auto mparams_paged = llama_model_default_params();
++    mparams_paged.use_moe_expert_paging = true;
++    mparams_paged.use_extra_bufts = false;
++    llama_model * model_paged = llama_model_load_from_file(fixture_path.c_str(), mparams_paged);
++    require(model_paged != nullptr, "paged model load failed");
++
++    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_res));
++    require(n_vocab > 0, "n_vocab must be positive");
++
++    const std::vector<int> prompt_lengths = { 1, 2, 5, 33 };
++
++    for (int len : prompt_lengths) {
++        std::vector<llama_token> tokens(len);
++        for (int i = 0; i < len; ++i) {
++            tokens[i] = static_cast<llama_token>((i * 7 + 3) % (n_vocab > 10 ? 10 : n_vocab) + 1);
++        }
++
++        // Resident run (normal ubatch)
++        auto cparams_res = llama_context_default_params();
++        cparams_res.n_ctx = len + 16;
++        cparams_res.n_batch = len + 16;
++        cparams_res.n_ubatch = len + 16;
++        cparams_res.n_seq_max = 1;
++        auto logits_res = run_eval_sequence(model_res, cparams_res, tokens, 4);
++
++        // Resident run (1-token ubatch for exact parity check)
++        auto cparams_res_u1 = cparams_res;
++        cparams_res_u1.n_ubatch = 1;
++        auto logits_res_u1 = run_eval_sequence(model_res, cparams_res_u1, tokens, 4);
++
++        // Paged run (n_ubatch=1 bounded)
++        auto cparams_paged = llama_context_default_params();
++        cparams_paged.n_ctx = len + 16;
++        cparams_paged.n_batch = len + 16;
++        cparams_paged.n_ubatch = 1;
++        cparams_paged.n_seq_max = 1;
++        cparams_paged.moe_cache_size = 64 * 1024 * 1024;
++        auto logits_paged = run_eval_sequence(model_paged, cparams_paged, tokens, 4);
++
++        assert_logits_parity(logits_res_u1, logits_paged, 1e-6f);
++        assert_logits_parity(logits_res, logits_paged, 1e-5f);
++    }
++
++    llama_model_free(model_res);
++    llama_model_free(model_paged);
++}
++
++static void test_warmup_and_eviction_parity(const std::string & fixture_path) {
++    auto mparams_res = llama_model_default_params();
++    mparams_res.use_moe_expert_paging = false;
++    mparams_res.use_extra_bufts = false;
++    llama_model * model_res = llama_model_load_from_file(fixture_path.c_str(), mparams_res);
++    require(model_res != nullptr, "resident model load failed");
++
++    auto mparams_paged = llama_model_default_params();
++    mparams_paged.use_moe_expert_paging = true;
++    mparams_paged.use_extra_bufts = false;
++    llama_model * model_paged = llama_model_load_from_file(fixture_path.c_str(), mparams_paged);
++    require(model_paged != nullptr, "paged model load failed");
++
++    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_res));
++    const int total_tokens = 25;
++
++    std::vector<llama_token> tokens(3);
++    for (size_t i = 0; i < tokens.size(); ++i) {
++        tokens[i] = static_cast<llama_token>((i + 1) % n_vocab);
++    }
++
++    // Resident baseline for 3 prompt tokens + 22 decode steps
++    auto cparams_res = llama_context_default_params();
++    cparams_res.n_ctx = total_tokens + 8;
++    cparams_res.n_batch = total_tokens + 8;
++    cparams_res.n_ubatch = total_tokens + 8;
++    cparams_res.n_seq_max = 1;
++    auto logits_res = run_eval_sequence(model_res, cparams_res, tokens, 22);
++
++    // Paged run with warmup and forced repeated evictions
++    auto cparams_paged = llama_context_default_params();
++    cparams_paged.n_ctx = total_tokens + 8;
++    cparams_paged.n_batch = total_tokens + 8;
++    cparams_paged.n_ubatch = 1;
++    cparams_paged.n_seq_max = 1;
++    cparams_paged.moe_cache_size = 4 * 1024 * 1024; // smaller budget forcing repeated eviction
++
++    llama_context * ctx_paged = llama_init_from_model(model_paged, cparams_paged);
++    require(ctx_paged != nullptr, "failed to create paged context");
++
++    // Exercise warmup transition
++    llama_set_warmup(ctx_paged, true);
++    llama_set_warmup(ctx_paged, false);
++
++    llama_batch batch = llama_batch_init(total_tokens + 8, 0, 1);
++    for (size_t i = 0; i < tokens.size(); ++i) {
++        llama_batch_add(batch, tokens[i], i, { 0 }, i == tokens.size() - 1);
++    }
++    int ret = llama_decode(ctx_paged, batch);
++    require(ret == 0, "paged prefill failed");
++
++    std::vector<float> logits_paged;
++    float * cur_logits = llama_get_logits_ith(ctx_paged, -1);
++    require(cur_logits != nullptr, "null logits");
++    logits_paged.assign(cur_logits, cur_logits + n_vocab);
++
++    for (int step = 0; step < 22; ++step) {
++        llama_token next_token = 0;
++        float max_logit = -std::numeric_limits<float>::infinity();
++        for (int v = 0; v < n_vocab; ++v) {
++            if (cur_logits[v] > max_logit) {
++                max_logit = cur_logits[v];
++                next_token = v;
++            }
++        }
++
++        llama_batch_clear(batch);
++        llama_batch_add(batch, next_token, tokens.size() + step, { 0 }, true);
++
++        ret = llama_decode(ctx_paged, batch);
++        require(ret == 0, "paged decode step failed");
++
++        cur_logits = llama_get_logits_ith(ctx_paged, -1);
++        require(cur_logits != nullptr, "null logits in decode step");
++        logits_paged.insert(logits_paged.end(), cur_logits, cur_logits + n_vocab);
++    }
++
++    llama_batch_free(batch);
++    llama_free(ctx_paged);
++
++    assert_logits_parity(logits_res, logits_paged, 1e-5f);
++
++    llama_model_free(model_res);
++    llama_model_free(model_paged);
++}
++
++static void test_fault_injection_and_recovery(const std::string & fixture_path) {
++    auto mparams_res = llama_model_default_params();
++    mparams_res.use_moe_expert_paging = false;
++    mparams_res.use_extra_bufts = false;
++    llama_model * model_res = llama_model_load_from_file(fixture_path.c_str(), mparams_res);
++    require(model_res != nullptr, "resident model load failed");
++
++    auto mparams_paged = llama_model_default_params();
++    mparams_paged.use_moe_expert_paging = true;
++    mparams_paged.use_extra_bufts = false;
++    llama_model * model_paged = llama_model_load_from_file(fixture_path.c_str(), mparams_paged);
++    require(model_paged != nullptr, "paged model load failed");
++
++    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_res));
++
++    const std::vector<llama_token> tokens = { 1, 2 };
++
++    // Baseline logits on resident model
++    auto cparams_res = llama_context_default_params();
++    cparams_res.n_ctx = 32;
++    cparams_res.n_batch = 32;
++    cparams_res.n_ubatch = 32;
++    cparams_res.n_seq_max = 1;
++    auto logits_baseline = run_eval_sequence(model_res, cparams_res, tokens, 1);
++
++    // Paged context
++    auto cparams_paged = llama_context_default_params();
++    cparams_paged.n_ctx = 32;
++    cparams_paged.n_batch = 32;
++    cparams_paged.n_ubatch = 1;
++    cparams_paged.n_seq_max = 1;
++    cparams_paged.moe_cache_size = 32 * 1024 * 1024;
++    llama_context * ctx_paged = llama_init_from_model(model_paged, cparams_paged);
++    require(ctx_paged != nullptr, "paged context init failed");
++
++    // 1. Initial prefill succeeds
++    llama_batch batch = llama_batch_init(32, 0, 1);
++    for (size_t i = 0; i < tokens.size(); ++i) {
++        llama_batch_add(batch, tokens[i], i, { 0 }, i == tokens.size() - 1);
++    }
++    int ret = llama_decode(ctx_paged, batch);
++    require(ret == 0, "initial prefill failed");
++
++    // 2. Inject fault on next upload
++    llama_moe_set_fault_injection(ctx_paged, true, 0);
++
++    llama_batch_clear(batch);
++    llama_batch_add(batch, 3, tokens.size(), { 0 }, true);
++
++    ret = llama_decode(ctx_paged, batch);
++    // Must fail closed with error code -3 (GGML_STATUS_FAILED)
++    require(ret != 0, "decode must fail closed under fault injection");
++    require(ret == -3, "decode error return code must be -3");
++
++    // 3. Clear fault injection and recover
++    llama_moe_set_fault_injection(ctx_paged, false, 0);
++
++    // Clear KV cache and context state
++    llama_memory_clear(llama_get_memory(ctx_paged), true);
++
++    // 4. Retry sequence from scratch - must succeed and match baseline
++    llama_batch_clear(batch);
++    for (size_t i = 0; i < tokens.size(); ++i) {
++        llama_batch_add(batch, tokens[i], i, { 0 }, i == tokens.size() - 1);
++    }
++    ret = llama_decode(ctx_paged, batch);
++    require(ret == 0, "recovery prefill failed");
++
++    float * logits = llama_get_logits_ith(ctx_paged, -1);
++    require(logits != nullptr, "null logits on recovery prefill");
++    std::vector<float> recovered_logits(logits, logits + n_vocab);
++
++    llama_token next_token = 0;
++    float max_logit = -std::numeric_limits<float>::infinity();
++    for (int v = 0; v < n_vocab; ++v) {
++        if (logits[v] > max_logit) {
++            max_logit = logits[v];
++            next_token = v;
++        }
++    }
++
++    llama_batch_clear(batch);
++    llama_batch_add(batch, next_token, tokens.size(), { 0 }, true);
++    ret = llama_decode(ctx_paged, batch);
++    require(ret == 0, "recovery decode step failed");
++
++    logits = llama_get_logits_ith(ctx_paged, -1);
++    require(logits != nullptr, "null logits on recovery decode");
++    recovered_logits.insert(recovered_logits.end(), logits, logits + n_vocab);
++
++    assert_logits_parity(logits_baseline, recovered_logits, 1e-5f);
++
++    llama_batch_free(batch);
++    llama_free(ctx_paged);
++    llama_model_free(model_res);
++    llama_model_free(model_paged);
++}
++
++int main() {
++    try {
++        llama_backend_init();
++
++        const std::string fixture_path = find_fixture_path("tests/fixtures/moe_paging/qwen3moe-tiny-f32.gguf");
++        if (fixture_path.empty()) {
++            std::fprintf(stderr, "warning: qwen3moe-tiny-f32.gguf fixture not found, skipping inference tests\n");
++            llama_backend_free();
++            return 0;
++        }
++
++        std::fprintf(stderr, "Running test_context_validation_and_budget_floor...\n");
++        test_context_validation_and_budget_floor(fixture_path);
++
++        std::fprintf(stderr, "Running test_prefill_and_decode_parity...\n");
++        test_prefill_and_decode_parity(fixture_path);
++
++        std::fprintf(stderr, "Running test_warmup_and_eviction_parity...\n");
++        test_warmup_and_eviction_parity(fixture_path);
++
++        std::fprintf(stderr, "Running test_fault_injection_and_recovery...\n");
++        test_fault_injection_and_recovery(fixture_path);
++
++        llama_backend_free();
++    } catch (const std::exception & e) {
++        std::fprintf(stderr, "test-moe-paging-inference: FAILED: %s\n", e.what());
++        llama_backend_free();
++        return 1;
++    }
++    std::fprintf(stderr, "test-moe-paging-inference: all tests passed\n");
++    return 0;
++}

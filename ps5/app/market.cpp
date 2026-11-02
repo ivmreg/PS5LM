@@ -15,6 +15,7 @@ extern "C" {
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cctype>
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
@@ -26,6 +27,52 @@ namespace ps5lm {
 namespace {
 
 constexpr const char * kHub = "https://huggingface.co";
+
+struct SplitName {
+    bool split = false;
+    bool first = false;
+};
+
+SplitName split_name(const std::string & path) {
+    const size_t slash = path.find_last_of("/\\");
+    const std::string leaf = path.substr(slash == std::string::npos ? 0 : slash + 1);
+    if (leaf.size() < 18 || leaf.compare(leaf.size() - 5, 5, ".gguf") != 0) {
+        return {};
+    }
+    const size_t ext = leaf.size() - 5;
+    for (size_t of = leaf.find("-of-"); of != std::string::npos; of = leaf.find("-of-", of + 1)) {
+        if (of < 6 || of + 9 != ext || leaf[of - 6] != '-') {
+            continue;
+        }
+        bool digits = true;
+        for (size_t i = of - 5; i < of; ++i) {
+            digits = digits && std::isdigit((unsigned char) leaf[i]);
+        }
+        for (size_t i = of + 4; i < ext; ++i) {
+            digits = digits && std::isdigit((unsigned char) leaf[i]);
+        }
+        if (!digits) {
+            continue;
+        }
+        const std::string index = leaf.substr(of - 5, 5);
+        const std::string count = leaf.substr(of + 4, 5);
+        if (index == "00000" || count == "00000" || index > count) {
+            continue;
+        }
+        return { true, index == "00001" };
+    }
+    return {};
+}
+
+std::string unsupported_reason(bool split, bool stripped) {
+    if (split && stripped) {
+        return "Unsupported: this model is split and has stripped experts; copy all shards locally and use a full, unstripped GGUF.";
+    }
+    if (split) {
+        return "Unsupported: split models need all shards; copy all shards locally. Search downloads only support single files.";
+    }
+    return "Unsupported: this GGUF has stripped experts; use a full, unstripped GGUF.";
+}
 
 std::string url_encode(const std::string & s) {
     std::string out;
@@ -133,9 +180,13 @@ void Market::open_repo(int index) {
             for (const auto & e : j) {
                 const std::string path = e.value("path", std::string());
                 const bool gguf = path.size() > 5 && path.compare(path.size() - 5, 5, ".gguf") == 0;
+                const SplitName split = split_name(path);
+                const size_t slash = path.find_last_of("/\\");
+                const std::string leaf = path.substr(slash == std::string::npos ? 0 : slash + 1);
+                const bool first_shard = leaf.find("-00001-of-") != std::string::npos;
                 // Projectors and later parts of split models are not models of their own.
                 if (!gguf || path.find("mmproj") != std::string::npos ||
-                    (path.find("-of-") != std::string::npos && path.find("-00001-of-") == std::string::npos)) {
+                    (leaf.find("-of-") != std::string::npos && !first_shard)) {
                     continue;
                 }
                 MarketFile f;
@@ -145,9 +196,16 @@ void Market::open_repo(int index) {
                     f.sha256 = e["lfs"].value("oid", std::string());
                     f.bytes = e["lfs"].value("size", f.bytes);
                 }
-                // Before the header is read: fits if the weights and the
-                // planner's smallest reserve do.
-                f.fits = f.bytes / 1073741824.0 + 1.0 <= budget_gib_ ? -1 : 0;
+                // A shard cannot be downloaded as a complete model.
+                f.unsupported = first_shard || (split.split && split.first);
+                if (f.unsupported) {
+                    f.fits = -3;
+                    f.plan = unsupported_reason(true, false);
+                } else {
+                    // Before the header is read: fits if the weights and the
+                    // planner's smallest reserve do.
+                    f.fits = f.bytes / 1073741824.0 + 1.0 <= budget_gib_ ? -1 : 0;
+                }
                 if (f.fits == 0) {
                     f.plan = "too big: the weights alone need more than is free";
                 }
@@ -173,6 +231,14 @@ void Market::plan_file(int repo, int file) {
             return;
         }
         MarketFile & f = view_.repos[(size_t) repo].files[(size_t) file];
+        if (f.unsupported || split_name(f.name).split) {
+            f.unsupported = true;
+            f.fits = -3;
+            if (f.plan.empty()) {
+                f.plan = unsupported_reason(true, false);
+            }
+            return;
+        }
         if ((f.fits != -1 && f.fits != -2) || f.checking) {
             return;  // planned already, too big by its size alone, or waiting
         }
@@ -198,14 +264,18 @@ void Market::plan_file(int repo, int file) {
             const std::string head = get_text(std::string(kHub) + "/" + job.repo + "/resolve/main/" + job.file,
                                               "bytes=0-16777215", &error, 16u << 20);
             const ModelInfo m = read_model_header(job.file, head, job.bytes);
-            const Plan      p = plan_model(m, budget_gib_);
+            const bool split = m.split_count > 1 || m.split_index != 0;
+            const bool unsupported = split || m.stripped_experts;
+            const Plan p = m.ok && !unsupported ? plan_model(m, budget_gib_) : Plan{};
             std::lock_guard<std::mutex> lock(mutex_);
             for (auto & r : view_.repos) {
                 for (auto & f : r.files) {
                     if (r.id == job.repo && f.name == job.file) {
-                        f.fits = m.ok ? (p.fits ? 1 : 0) : -2;
+                        f.unsupported = unsupported;
+                        f.fits = unsupported ? -3 : m.ok ? (p.fits ? 1 : 0) : -2;
                         f.checking = false;
-                        f.plan = m.ok ? p.why : (!error.empty() ? error : m.error);
+                        f.plan = unsupported ? unsupported_reason(split, m.stripped_experts)
+                                : m.ok ? p.why : (!error.empty() ? error : m.error);
                     }
                 }
             }
@@ -215,17 +285,33 @@ void Market::plan_file(int repo, int file) {
 
 bool Market::job(int repo, int file, const std::string & dir, MarketJob * out) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (repo < 0 || repo >= (int) view_.repos.size() || file < 0 || file >= (int) view_.repos[(size_t) repo].files.size()) {
+    if (!out || repo < 0 || repo >= (int) view_.repos.size() || file < 0 || file >= (int) view_.repos[(size_t) repo].files.size()) {
         return false;
     }
     const MarketFile & f = view_.repos[(size_t) repo].files[(size_t) file];
+    if (f.unsupported || split_name(f.name).split) {
+        view_.note = f.plan.empty() ? unsupported_reason(true, false) : f.plan;
+        return false;
+    }
+    if (f.checking || f.fits == -1) {
+        view_.note = "Check the GGUF header before downloading";
+        return false;
+    }
+    if (f.fits == 0) {
+        view_.note = f.plan.empty() ? "The model does not fit" : f.plan;
+        return false;
+    }
     *out = { view_.repos[(size_t) repo].id, f.name, f.sha256, dir, f.bytes };
     return true;
 }
 
 namespace {
 
+#ifdef PS5LM_MARKET_TEST_QUEUE
+constexpr const char * kQueue = "build/market-test-queue.json";
+#else
 constexpr const char * kQueue = "/data/PS5LM/downloads.json";
+#endif
 
 // Pieces at once, each on its own template (made once, one after the
 // other). Measured on the console (CHANGELOG 0.8.0): one connection gets 3
@@ -294,6 +380,10 @@ void Market::load_queue() {
         // v0.7 queues had no "resume": their partial files were written in order.
         d.resume = e.value("resume", file_size(part_path(d)));
         d.done = d.state == DownloadState::done ? d.bytes : d.resume;
+        if (d.state != DownloadState::done && split_name(d.file).split) {
+            d.state = DownloadState::failed;
+            d.note = unsupported_reason(true, false);
+        }
         if (!d.repo.empty() && !d.file.empty()) {
             view_.downloads.push_back(d);
         }
@@ -305,6 +395,21 @@ void Market::load_queue() {
 
 bool Market::enqueue(const MarketJob & job, double free) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (split_name(job.file).split) {
+        view_.note = unsupported_reason(true, false);
+        return false;
+    }
+    for (const auto & repo : view_.repos) {
+        if (repo.id != job.repo) {
+            continue;
+        }
+        for (const auto & file : repo.files) {
+            if (file.name == job.file && file.unsupported) {
+                view_.note = file.plan.empty() ? unsupported_reason(true, false) : file.plan;
+                return false;
+            }
+        }
+    }
     for (const auto & d : view_.downloads) {
         if (d.repo == job.repo && d.file == job.file && d.state != DownloadState::done) {
             view_.note = job.file + " is in Downloads already";
@@ -354,6 +459,13 @@ void Market::resume(int i) {
     }
     Download & d = view_.downloads[(size_t) i];
     if (d.state == DownloadState::paused || d.state == DownloadState::failed) {
+        if (split_name(d.file).split) {
+            d.state = DownloadState::failed;
+            d.note = unsupported_reason(true, false);
+            save_queue();
+            view_.note = d.note;
+            return;
+        }
         d.state = DownloadState::queued;
         d.attempt = 0;
         d.note.clear();
@@ -386,6 +498,17 @@ void Market::worker() {
         Download d;
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            bool rejected = false;
+            for (auto & x : view_.downloads) {
+                if (x.state == DownloadState::queued && split_name(x.file).split) {
+                    x.state = DownloadState::failed;
+                    x.note = unsupported_reason(true, false);
+                    rejected = true;
+                }
+            }
+            if (rejected) {
+                save_queue();
+            }
             auto it = std::find_if(view_.downloads.begin(), view_.downloads.end(),
                                    [](const Download & x) { return x.state == DownloadState::queued; });
             if (it == view_.downloads.end()) {

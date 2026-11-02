@@ -5,10 +5,12 @@ on pull requests and pushes to `main` or `ci/**`. It uses ordinary Ubuntu hosted
 runners, a read-only token, no secrets, and no console connection. Superseded runs
 are cancelled. There are two independent jobs:
 
-- **Host checks** (5-minute limit): shell/Python syntax, the existing synthetic
-  GGUF `model_plan_test.cpp`, and regressions for dashboard compiler job limits
-  and propagation of failed background compilers. No submodule or model download
-  is needed for these checks.
+- **Host checks** (5-minute limit): shell/Python syntax, synthetic GGUF planner
+  regressions, market split-model checks with mocked HTTP and FTP stubs,
+  settings persistence, dashboard host syntax, and the Python build-queue and streaming-benchmark
+  suites. The workflow initializes the pinned llama.cpp and UI submodules first;
+  the host test runner makes no external network requests. Benchmark and market
+  HTTP behavior uses local mocks only.
 - **Full PS5 title cross-build** (45-minute limit, two compiler jobs): bootstrap
   the public SDK, reproduce clean-room `libc.prx`, build patched RADV and the
   existing llama-server/native dashboard, package the title folder, and inspect
@@ -23,16 +25,21 @@ Normal `scripts/build-app.sh` builds keep the prebuilt browser UI enabled;
 
 ## Reproduce the checks
 
-Host checks need Bash, Python 3 and a C++17 compiler:
+Host checks need Bash, Python 3, a C99 compiler, and a C++17/C++20 compiler.
+Initialize the pinned headers used by the market and settings tests, then run
+the regression script from the repository root:
 
-```sh
+~~~sh
+git submodule update --init --depth 1 -- third_party/llama.cpp third_party/ps5-homebrew-ui
 for script in scripts/*.sh ps5/app/ps5cc ps5/app/ps5cxx; do bash -n "$script"; done
 PYTHONPYCACHEPREFIX=build/pycache python3 -m py_compile scripts/*.py
-PYTHONPYCACHEPREFIX=build/pycache python3 -m unittest discover -s tests -p 'test_build_app.py' -v
-mkdir -p build
-c++ -std=c++17 -O1 ps5/app/model_plan_test.cpp ps5/app/model_plan.cpp -o build/model_plan_test
-build/model_plan_test
-```
+bash scripts/test-host.sh
+~~~
+
+The runner stores compiled checks in build/host-tests, Python bytecode in
+build/pycache, and the mocked market queue in build/market-test-queue.json.
+The market test's HTTP and FTP calls are replaced by stubs; it does not contact
+Hugging Face or a console.
 
 For the full build, use the digest-pinned Debian trixie container and exact apt
 package list in the workflow, or an x86-64 Linux host with equivalent tools:

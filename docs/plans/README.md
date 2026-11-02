@@ -1,5 +1,18 @@
 # Plans
 
+[Next stage: models beyond RAM](beyond-ram-models.md) is the current priority:
+extend the existing expert cache with bounded storage reads so a previously
+non-fitting model can run. It contains bounded Luna-max assignments and Codex
+correctness, hardware and useful-answer gates.
+
+[Measured improvements](next-stage-measured-improvements.md) is a supporting
+backlog, superseded as the next-stage priority by the capability plan above.
+
+[PS5LM improvement plan](ps5lm-improvements.md) describes the current Luna
+implementation packages, acceptance checks and measurement gates. Codex owns
+integration and final validation; the plan does not imply a release or console
+deployment.
+
 The next phase, split into one goal per branch. Each branch starts from
 `main`, merges back into `main` when its "done when" holds on the console,
 and bumps the version in `ps5/app/version.hpp` with a CHANGELOG entry.

@@ -23,6 +23,10 @@ struct ModelInfo {
     std::string arch;   // general.architecture
     std::string decision;  // "<arch>.decision.type" (openjev, clef, lfm2-d1, ...): answers /v1/systemone, not chat
     uint64_t    file_bytes      = 0;
+    uint32_t    split_count     = 1;  // GGUF split.count, or 1 for a single file
+    uint32_t    split_index     = 0;  // GGUF split.no, zero-based
+    bool        split_metadata_present = false;
+    bool        stripped_experts = false;
     uint32_t    n_layer         = 0;
     uint32_t    n_head_kv       = 0;
     uint32_t    key_length      = 0;   // per KV head
@@ -30,6 +34,13 @@ struct ModelInfo {
     uint32_t    full_attn_every = 1;   // 1: every layer is attention
     uint32_t    n_ctx_train     = 0;
     uint32_t    n_expert        = 0;   // 0: dense
+    uint32_t    n_expert_used   = 0;
+    uint64_t    expert_bytes    = 0;   // total byte size of routed expert weight tensors (when tensor directory is parsed)
+    uint64_t    non_expert_bytes = 0;  // file_bytes minus expert_bytes (or non-expert tensor bytes + header overhead)
+    uint64_t    moe_cache_min_bytes = 0; // minimum MoE cache + staging bytes required for 1-token paged execution across all layout groups
+    uint64_t    moe_max_expert_slice_bytes = 0; // largest single expert slice stride (nb[2]) for staging buffer accounting
+    bool        moe_paging_supported = false;
+    std::string moe_paging_error;
     uint64_t    state_bytes     = 0;   // recurrent state, all layers (f32)
     std::string mmproj;                // a vision projector beside the model, or empty
     uint64_t    mmproj_bytes    = 0;
@@ -66,6 +77,9 @@ const Preset * find_preset(const ModelInfo & m);
 
 struct Plan {
     bool        fits = false;
+    bool        paged_moe = false;
+    uint32_t    moe_cache_mib = 0;
+    double      moe_cache_gib = 0;
     uint32_t    ctx  = 0;
     std::string kv_type;      // cache type for K and V
     double      weights_gib  = 0;
@@ -79,7 +93,11 @@ struct Plan {
 
 // budget_gib: device memory free before loading (the app reads it from ggml).
 // kv_force: one cache type ("f16", "q8_0", "q4_0") instead of the best that fits.
-Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap = 65536, const char * kv_force = nullptr);
+// planning_profile: "long_context" (default), "balanced" or "kv_precision".
+// Existing calls retain the long-context policy.
+Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap = 65536,
+                const char * kv_force = nullptr, const char * planning_profile = "long_context",
+                bool allow_paged_moe = false, uint32_t moe_cache_mib = 2048);
 
 // Every .gguf in the given folders (not recursive), sorted by name. Split
 // files are listed by their first part only.

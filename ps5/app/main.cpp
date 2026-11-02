@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -47,6 +48,7 @@
 #include "model_plan.hpp"
 #include "settings.hpp"
 #include "stats.hpp"
+#include "storage_probe.h"
 #include "suggested.hpp"
 #include "version.hpp"
 
@@ -107,6 +109,10 @@ constexpr const char * kEnv         = "/data/PS5LM/env.txt";  // driver and ggml
 constexpr const char * kTextOnly    = "/data/PS5LM/text-only";  // the last load's projector failed: load without it once
 constexpr const char * kQuit        = "/data/PS5LM/quit";
 constexpr const char * kSettings    = "/data/PS5LM/settings.json";
+constexpr const char * kStorageProbeRequest = "/data/PS5LM/bench-read";
+constexpr const char * kStorageProbeCancel  = "/data/PS5LM/bench-read-cancel";
+constexpr const char * kStorageProbeTemp    = "/data/PS5LM/.storage-probe.json.tmp";
+constexpr const char * kStorageProbeResult  = "/data/PS5LM/storage-probe.json";
 constexpr const char * kScratch     = "/data/PS5LM/scratch";
 // The file tools only: a title cannot start processes (no shell command).
 constexpr const char * kTools       = "read_file,write_file,edit_file,file_glob_search,grep_search,get_info";
@@ -116,6 +122,21 @@ constexpr const char * kAssets      = "/app0/assets";
 constexpr int          kPort        = 8081;
 const std::vector<std::string> kModelDirs = { kModels, "/mnt/ext0/PS5LM/models", "/mnt/usb0/PS5LM/models",
                                               "/mnt/usb1/PS5LM/models", "/mnt/usb0", "/mnt/usb1" };
+
+struct StorageProbeWorker {
+    std::atomic<bool> active{ false };
+    std::atomic<bool> cancel{ false };
+    std::atomic<bool> finished{ false };
+    pthread_t thread{};
+    bool thread_started = false;  // owned by the render/control thread
+    int result = -1;              // published by finished (release/acquire)
+    char path[STORAGE_PROBE_MAX_PATH_BYTES] = {};
+};
+
+StorageProbeWorker g_storage_probe;
+
+void cancel_storage_probe(const char *reason);
+void poll_storage_probe_worker();
 
 // The last lines of a log, up to about 64 KiB of it, oldest first.
 std::vector<std::string> tail_lines(const char * path) {
@@ -283,6 +304,7 @@ void quit_if_asked() {
     if (access(kQuit, F_OK) != 0) {
         return;
     }
+    cancel_storage_probe("quit");
     unlink(kQuit);
     std::printf("ps5lm-app: quit requested\n");
     std::fflush(nullptr);
@@ -339,6 +361,175 @@ std::string take_request_file(const char * path) {
     std::ifstream(path) >> line;
     unlink(path);
     return line.empty() ? std::string("-") : line;
+}
+
+// The storage request contains a whole path line, so unlike the older
+// word-based controls it accepts spaces but has a fixed input bound.
+std::string take_request_line(const char * path, size_t limit) {
+    if (access(path, F_OK) != 0) {
+        return {};
+    }
+    std::ifstream in(path, std::ios::binary);
+    std::string line;
+    char c = 0;
+    bool invalid = !in;
+    bool ended = false;
+    while (!invalid && in.get(c)) {
+        if (c == '\n') {
+            ended = true;
+            break;
+        }
+        if (line.size() >= limit) {
+            invalid = true;
+            break;
+        }
+        line.push_back(c);
+    }
+    if (!invalid && ended && in.get(c)) {
+        invalid = true;  // only one path line is accepted
+    }
+    in.close();
+    unlink(path);
+    if (invalid) {
+        return std::string(1, '\1');
+    }
+    if (!line.empty() && line.back() == '\r') {
+        line.pop_back();
+    }
+    return line.empty() ? std::string("-") : line;
+}
+
+int storage_probe_cancelled(void * context) {
+    auto * worker = static_cast<StorageProbeWorker *>(context);
+    return worker->cancel.load(std::memory_order_acquire) ? 1 : 0;
+}
+
+bool write_storage_probe_result(const storage_probe_report_t & report) {
+    const int fd = open(kStorageProbeTemp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0666);
+    if (fd < 0) {
+        return false;
+    }
+    FILE * out = fdopen(fd, "wb");
+    if (!out) {
+        const int saved_errno = errno;
+        close(fd);
+        unlink(kStorageProbeTemp);
+        errno = saved_errno;
+        return false;
+    }
+
+    storage_probe_write_json(out, &report);
+    bool ok = std::fputc('\n', out) != EOF && std::fflush(out) == 0;
+    if (ok) {
+        ok = fsync(fileno(out)) == 0;
+    }
+    const int close_rc = std::fclose(out);
+    if (close_rc != 0) {
+        ok = false;
+    }
+    if (!ok) {
+        const int saved_errno = errno;
+        unlink(kStorageProbeTemp);
+        errno = saved_errno;
+        return false;
+    }
+    if (rename(kStorageProbeTemp, kStorageProbeResult) != 0) {
+        const int saved_errno = errno;
+        unlink(kStorageProbeTemp);
+        errno = saved_errno;
+        return false;
+    }
+    return true;
+}
+
+void * storage_probe_worker(void * context) {
+    auto * worker = static_cast<StorageProbeWorker *>(context);
+    storage_probe_options_t options;
+    storage_probe_options_default(&options);
+    storage_probe_report_t report;
+    const int rc = storage_probe_run(worker->path, &options, storage_probe_cancelled, worker, &report);
+    std::snprintf(report.execution_context, sizeof(report.execution_context), "native_title");
+    const bool saved = write_storage_probe_result(report);
+    const int saved_errno = saved ? 0 : errno;
+    worker->result = rc;
+    std::printf("ps5lm-app: storage-probe %s, %llu logical bytes, result %s%s%s\n",
+                storage_probe_status_name(report.status), (unsigned long long)report.logical_read_bytes,
+                saved ? "saved" : "write failed", saved ? "" : ": ", saved ? "" : std::strerror(saved_errno));
+    std::fflush(stdout);
+    worker->finished.store(true, std::memory_order_release);
+    return nullptr;
+}
+
+bool start_storage_probe(const std::string & path) {
+    if (path.empty() || path[0] != '/' || path.size() >= STORAGE_PROBE_MAX_PATH_BYTES ||
+        std::any_of(path.begin(), path.end(), [](unsigned char c) { return c < 0x20 || c == 0x7f; })) {
+        std::printf("ps5lm-app: storage-probe requires one absolute path line under %u bytes\n",
+                    STORAGE_PROBE_MAX_PATH_BYTES);
+        return false;
+    }
+    bool expected = false;
+    if (!g_storage_probe.active.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        std::printf("ps5lm-app: storage-probe already active; request refused\n");
+        return false;
+    }
+    if (unlink(kStorageProbeResult) != 0 && errno != ENOENT) {
+        const int saved_errno = errno;
+        g_storage_probe.active.store(false, std::memory_order_release);
+        std::printf("ps5lm-app: cannot prepare storage-probe result: %s\n", std::strerror(saved_errno));
+        return false;
+    }
+
+    std::memcpy(g_storage_probe.path, path.c_str(), path.size() + 1);
+    g_storage_probe.cancel.store(false, std::memory_order_release);
+    g_storage_probe.finished.store(false, std::memory_order_release);
+    pthread_attr_t attr;
+    int rc = pthread_attr_init(&attr);
+    const bool attr_initialized = rc == 0;
+    if (rc == 0) {
+        rc = pthread_attr_setstacksize(&attr, 1u << 20);
+    }
+    if (rc == 0) {
+        rc = pthread_create(&g_storage_probe.thread, &attr, storage_probe_worker, &g_storage_probe);
+    }
+    if (rc == 0) {
+        g_storage_probe.thread_started = true;
+    }
+    if (attr_initialized) {
+        pthread_attr_destroy(&attr);
+    }
+    if (rc != 0) {
+        g_storage_probe.active.store(false, std::memory_order_release);
+        std::printf("ps5lm-app: storage-probe worker could not start (pthread error %d)\n", rc);
+        return false;
+    }
+    std::printf("ps5lm-app: storage-probe started for %s (cancel with bench-read-cancel)\n", path.c_str());
+    return true;
+}
+
+void poll_storage_probe_worker() {
+    if (!g_storage_probe.active.load(std::memory_order_acquire) ||
+        !g_storage_probe.finished.load(std::memory_order_acquire)) {
+        return;
+    }
+    const int rc = g_storage_probe.thread_started ? pthread_join(g_storage_probe.thread, nullptr) : 0;
+    if (rc != 0) {
+        std::printf("ps5lm-app: storage-probe worker join failed (pthread error %d)\n", rc);
+        return;
+    }
+    g_storage_probe.thread_started = false;
+    g_storage_probe.finished.store(false, std::memory_order_release);
+    g_storage_probe.cancel.store(false, std::memory_order_release);
+    g_storage_probe.active.store(false, std::memory_order_release);
+    std::printf("ps5lm-app: storage-probe worker joined (exit %d)\n", g_storage_probe.result);
+}
+
+void cancel_storage_probe(const char * reason) {
+    if (!g_storage_probe.active.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (!g_storage_probe.cancel.exchange(true, std::memory_order_acq_rel)) {
+        std::printf("ps5lm-app: cancelling storage-probe before %s\n", reason);
+    }
 }
 
 // Where the memory is: the pool's free part, the CPU heap, and what ggml
@@ -503,7 +694,7 @@ struct Models {
                 rows.push_back(row);
                 continue;
             }
-            const Plan p = plan_model(m, budget_gib, settings.ctx_cap, kv);
+            const Plan p = plan_model(m, budget_gib, settings.ctx_cap, kv, settings.planning_profile.c_str(), settings.paged_moe, settings.moe_cache_mib);
             const Preset * pre = find_preset(m);
             row.arch = m.arch;
             row.plan = p.why;
@@ -529,7 +720,7 @@ struct Models {
     // The arguments for a model: the planner's, or app-args.txt's verbatim.
     std::vector<std::string> args_for(const std::string & path, Live & model_part) {
         const ModelInfo m = read_model_info(path);
-        const Plan p = plan_model(m, budget_gib, settings.ctx_cap, kv_force());
+        const Plan p = plan_model(m, budget_gib, settings.ctx_cap, kv_force(), settings.planning_profile.c_str(), settings.paged_moe, settings.moe_cache_mib);
         const Preset * pre = find_preset(m);
         model_part.model_label = base_name(path);
         model_part.model_file  = path;
@@ -630,6 +821,9 @@ bool load_font(hui::gfx::Renderer & renderer, const char * name, hui::gfx::Font 
 int main(int, char **) {
     // /data first: the log, the settings and the models live there.
     const std::string data = open_data();
+    // A previous process may have been replaced while flushing its temporary
+    // probe report. The final path is only published by rename.
+    unlink(kStorageProbeTemp);
     // stdout and stderr to a file the PC can fetch over FTP.
     if (std::freopen(kLog, "w", stdout) != nullptr) {
         setvbuf(stdout, nullptr, _IOLBF, 0);
@@ -864,6 +1058,9 @@ int main(int, char **) {
     bool rescanning = false;
     uint64_t restart_at = 0;  // the frame to stop the model and restart on, or 0
     for (uint64_t n = 0;; ++n) {
+        if (restart_at == 0 && access(kQuit, F_OK) != 0) {
+            poll_storage_probe_worker();
+        }
         const int64_t now = hui::sys::monotonic_us();
         const float dt = n == 0 ? 1.0f / 60.0f : std::min(0.05f, (float) (now - last) / 1e6f);
         last = now;
@@ -979,6 +1176,7 @@ int main(int, char **) {
         }
         // A restart asked for a few frames ago, once the busy screen is up.
         if (restart_at != 0 && n >= restart_at) {
+            cancel_storage_probe("LoadExec");
             std::fflush(nullptr);
             models.stop();
             sceSystemServiceLoadExec("/app0/eboot.bin", nullptr);
@@ -988,12 +1186,14 @@ int main(int, char **) {
         if (req.kind == Dashboard::Request::settings) {
             // The planner's limits change every row's plan; the loaded model
             // keeps its settings until it is loaded again.
-            // Only the context and cache limits change the plans; rescanning
+            // The profile, context and cache limits change the plans; rescanning
             // reads every model's header, seconds with a USB drive.
             const Settings was = models.settings;
             models.settings = dash.settings();
             save_settings(kSettings, models.settings);
-            if (was.ctx_cap != models.settings.ctx_cap || was.kv_type != models.settings.kv_type) {
+            if (was.ctx_cap != models.settings.ctx_cap || was.kv_type != models.settings.kv_type ||
+                was.planning_profile != models.settings.planning_profile ||
+                was.paged_moe != models.settings.paged_moe || was.moe_cache_mib != models.settings.moe_cache_mib) {
                 models.rescan(stats);
             }
             std::printf("ps5lm-app: settings saved\n");
@@ -1068,6 +1268,19 @@ int main(int, char **) {
                 std::thread(probe_fetch, u).detach();
             } else if (!take_request_file("/data/PS5LM/bench-write").empty()) {
                 std::thread(probe_write).detach();
+            } else if (std::string p = take_request_line(kStorageProbeRequest, STORAGE_PROBE_MAX_PATH_BYTES); !p.empty()) {
+                if (p.size() == 1 && p[0] == '\1') {
+                    std::printf("ps5lm-app: storage-probe request is too long or has multiple lines\n");
+                } else {
+                    start_storage_probe(p == "-" ? std::string() : p);
+                }
+                // Process a cancel uploaded immediately after the path in this
+                // same poll, so a fast client cannot miss the just-started run.
+                if (!take_request_file(kStorageProbeCancel).empty()) {
+                    cancel_storage_probe("bench-read-cancel");
+                }
+            } else if (!take_request_file(kStorageProbeCancel).empty()) {
+                cancel_storage_probe("bench-read-cancel");
             } else if (std::string q = take_request_file("/data/PS5LM/search"); !q.empty()) {
                 market.search(q == "-" ? std::string() : q);  // a query typed on the PC
             }

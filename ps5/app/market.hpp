@@ -20,8 +20,9 @@ struct MarketFile {
     std::string sha256;          // from the repository's LFS pointer
     uint64_t    bytes = 0;
     std::string plan;            // the planner's line, once its header was read
-    int         fits  = -1;      // 1 fits, 0 too big, -1 not planned yet, -2 could not tell
+    int         fits  = -1;      // 1 fits, 0 too big, -1 not planned, -2 could not tell, -3 unsupported
     bool        checking = false;  // its header is being read
+    bool        unsupported = false;  // cannot be downloaded as one complete model
 };
 
 struct MarketRepo {

@@ -15,9 +15,12 @@ struct Settings {
     std::string default_model;      // a path from the library, or empty
     uint32_t    ctx_cap   = 65536;  // the planner's longest context
     std::string kv_type   = "auto"; // "auto", "f16", "q8_0" or "q4_0"
+    std::string planning_profile = "long_context"; // "long_context", "balanced" or "kv_precision"
     bool        sounds    = true;
     bool        tools     = true;   // file tools in the browser chat, inside the scratch folder
     bool        introspect = false;  // POST /v1/introspect: raw logits and activations (off by default)
+    bool        paged_moe = false;   // opt-in SSD expert paging for beyond-RAM Qwen3-MoE models
+    uint32_t    moe_cache_mib = 2048; // GPU expert slot cache budget in MiB when paged_moe is enabled
     uint32_t    scratch_limit_gib = 2;  // warn when the scratch folder grows past this
     std::string download_dir = "/data/PS5LM/models";  // where the market saves models
 

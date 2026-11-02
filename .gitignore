@@ -1,3 +1,7 @@
+# Python caches
+__pycache__/
+*.pyc
+
 # toolchains and downloads
 .deps/
 

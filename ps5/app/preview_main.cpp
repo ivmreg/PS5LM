@@ -452,6 +452,13 @@ int main(int argc, char ** argv) {
     shot("18-settings-context");
     step(20, press(A::back), false);
     step(20, press(A::back), false);
+    step(20, press(A::confirm), false);
+    step(20, nav(D::down), false);
+    step(20, nav(D::down), false);
+    step(30, press(A::confirm), false);
+    shot("18b-settings-planning-profile");
+    step(20, press(A::back), false);
+    step(20, press(A::back), false);
     for (int i = 0; i < 3; ++i) {
         step(15, nav(D::down), false);
     }

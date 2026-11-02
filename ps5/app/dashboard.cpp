@@ -79,7 +79,7 @@ constexpr int          kMarketChipCount = 7;
 
 // ---- Settings -------------------------------------------------------------------
 
-enum class Setting : int { auto_load, default_model, ctx_cap, kv_type, sounds, tools, introspect, scratch_limit, clear_scratch, download_dir };
+enum class Setting : int { auto_load, default_model, ctx_cap, kv_type, planning_profile, sounds, tools, introspect, paged_moe, moe_cache_mib, scratch_limit, clear_scratch, download_dir };
 
 struct SettingRow {
     Setting      id;
@@ -100,8 +100,9 @@ constexpr SettingCategory kCategories[] = {
       2 },
     { "Model",
       { { Setting::ctx_cap, "Longest context", "The longest that fits, up to this; applies at the next load" },
-        { Setting::kv_type, "Context cache", "Auto picks the best that fits; a fixed type trades length for quality" } },
-      2 },
+        { Setting::kv_type, "Context cache", "Auto picks the best that fits; a fixed type trades length for quality" },
+        { Setting::planning_profile, "Planning profile", "Plans KV cache/context for the next load; model weights are unchanged" } },
+      3 },
     { "Chat",
       { { Setting::tools, "File tools", "The browser chat may read and write files in /data/PS5LM/scratch" },
         { Setting::scratch_limit, "Warn above", "A notification when that folder grows past this" },
@@ -113,8 +114,12 @@ constexpr SettingCategory kCategories[] = {
       2 },
     { "Developer",
       { { Setting::introspect, "Logits and activations API",
-          "Off: /v1/introspect is closed. On: the raw numbers. A change restarts the model" } },
-      1 },
+          "Off: /v1/introspect is closed. On: the raw numbers. A change restarts the model" },
+        { Setting::paged_moe, "Paged MoE (experimental)",
+          "Stream Qwen3-MoE experts from SSD when weights exceed RAM; 1-token prefill" },
+        { Setting::moe_cache_mib, "Paged MoE cache",
+          "GPU cache reserved for streamed experts when Paged MoE is on" } },
+      3 },
     { "Diagnostics", {}, 0 },
 };
 constexpr int kCategoryCount = 6;
@@ -122,6 +127,8 @@ constexpr int kDiagnostics = 5;
 
 constexpr uint32_t     kCtxSteps[] = { 4096, 8192, 16384, 32768, 65536, 131072 };
 constexpr const char * kKvSteps[] = { "auto", "f16", "q8_0", "q4_0" };
+constexpr const char * kPlanningProfileSteps[] = { "long_context", "balanced", "kv_precision" };
+constexpr uint32_t     kMoeCacheSteps[] = { 1024, 1536, 2048, 3072, 4096 };
 constexpr uint32_t     kScratchSteps[] = { 1, 2, 5, 10, 20 };
 
 constexpr int   kLogLines = 20;
@@ -395,6 +402,10 @@ std::string setting_text(const Settings & s, Setting id, const std::vector<Model
         }
         case Setting::ctx_cap: return format("%.0fk tokens", s.ctx_cap / 1024.0);
         case Setting::kv_type: return s.kv_type == "auto" ? "Auto" : s.kv_type;
+        case Setting::planning_profile:
+            return s.planning_profile == "balanced" ? "Balanced (16k target)"
+                 : s.planning_profile == "kv_precision" ? "KV precision" : "Long context";
+        case Setting::moe_cache_mib: return format("%.1f GB", s.moe_cache_mib / 1024.0);
         case Setting::scratch_limit: return format("%.0f GB", (double) s.scratch_limit_gib);
         case Setting::download_dir: {
             for (const auto & d : drives) {
@@ -408,7 +419,7 @@ std::string setting_text(const Settings & s, Setting id, const std::vector<Model
     }
 }
 
-bool is_toggle(Setting id) { return id == Setting::auto_load || id == Setting::sounds || id == Setting::tools || id == Setting::introspect; }
+bool is_toggle(Setting id) { return id == Setting::auto_load || id == Setting::sounds || id == Setting::tools || id == Setting::introspect || id == Setting::paged_moe; }
 
 bool toggle_value(const Settings & s, Setting id) {
     switch (id) {
@@ -416,6 +427,7 @@ bool toggle_value(const Settings & s, Setting id) {
         case Setting::sounds:     return s.sounds;
         case Setting::tools:      return s.tools;
         case Setting::introspect: return s.introspect;
+        case Setting::paged_moe:  return s.paged_moe;
         default:                  return false;
     }
 }
@@ -462,6 +474,21 @@ std::vector<Choice> choices_of(const Settings & s, Setting id, const std::vector
             }
             break;
         }
+        case Setting::planning_profile: {
+            const char * labels[] = { "Long context", "Balanced (16k target)", "KV precision" };
+            const char * notes[] = { "Prefer longer context", "Target a balanced 16k context", "Prefer higher-precision cache" };
+            for (int i = 0; i < 3; ++i) {
+                const std::string profile = kPlanningProfileSteps[i];
+                add(labels[i], notes[i], s.planning_profile == profile,
+                    [profile](Settings & v) { v.planning_profile = profile; });
+            }
+            break;
+        }
+        case Setting::moe_cache_mib:
+            for (uint32_t m : kMoeCacheSteps) {
+                add(format("%.1f GB", m / 1024.0), "", s.moe_cache_mib == m, [m](Settings & v) { v.moe_cache_mib = m; });
+            }
+            break;
         case Setting::scratch_limit:
             for (uint32_t g : kScratchSteps) {
                 add(format("%.0f GB", (double) g), "", s.scratch_limit_gib == g, [g](Settings & v) { v.scratch_limit_gib = g; });
@@ -856,32 +883,41 @@ void Dashboard::update_market(const hui::InputFrame & input, ui::Feedback & feed
             feedback.play(Cue::select);
         } else if (market_files_ && open && cursor < files) {
             const MarketFile & f = open->files[(size_t) cursor];
-            const double need = f.bytes / 1073741824.0 + 1.0;  // and 1 GiB spare, as Market::download wants
-            const Drive * to = nullptr;
-            const Drive * other = nullptr;  // the roomiest other drive it fits on
-            for (const auto & d : live_.drives) {
-                if (d.models == settings_.download_dir) {
-                    to = &d;
-                } else if (d.free >= need && (!other || d.free > other->free)) {
-                    other = &d;
+            if (f.unsupported) {
+                feedback.play(Cue::error);
+            } else if (f.fits == -1) {
+                if (!f.checking) {
+                    request_ = { Request::market_plan, "", market_.open, cursor };
                 }
-            }
-            market_dir_.clear();
-            if (f.fits == 0) {
-                feedback.play(Cue::error);  // too big
-            } else if (!to || (to->total > 0 && to->free < need)) {  // unknown space (no exporter) does not block
-                market_space_ = true;
-                market_dir_ = other ? other->models : "";
-                feedback.play(Cue::modal_open);
+                feedback.play(Cue::select);
             } else {
-                start_download(feedback);
+                const double need = f.bytes / 1073741824.0 + 1.0;  // and 1 GiB spare, as Market::download wants
+                const Drive * to = nullptr;
+                const Drive * other = nullptr;  // the roomiest other drive it fits on
+                for (const auto & d : live_.drives) {
+                    if (d.models == settings_.download_dir) {
+                        to = &d;
+                    } else if (d.free >= need && (!other || d.free > other->free)) {
+                        other = &d;
+                    }
+                }
+                market_dir_.clear();
+                if (f.fits == 0) {
+                    feedback.play(Cue::error);  // too big
+                } else if (!to || (to->total > 0 && to->free < need)) {  // unknown space (no exporter) does not block
+                    market_space_ = true;
+                    market_dir_ = other ? other->models : "";
+                    feedback.play(Cue::modal_open);
+                } else {
+                    start_download(feedback);
+                }
             }
         }
     }
     // Square: read this file's header now and say whether it fits.
     if (input.is_pressed(Action::west) && market_files_ && open && cursor < files) {
         const MarketFile & f = open->files[(size_t) cursor];
-        if (f.fits == -1 || f.fits == -2) {
+        if (!f.unsupported && (f.fits == -1 || f.fits == -2)) {
             request_ = { Request::market_plan, "", market_.open, cursor };
             feedback.play(Cue::select);
         } else {
@@ -980,7 +1016,8 @@ void Dashboard::update_settings(const hui::InputFrame & input, ui::Feedback & fe
         bool & on = id == Setting::auto_load  ? settings_.auto_load
                   : id == Setting::sounds     ? settings_.sounds
                   : id == Setting::tools      ? settings_.tools
-                                              : settings_.introspect;
+                  : id == Setting::introspect ? settings_.introspect
+                                              : settings_.paged_moe;
         on = !on;
         request_ = { Request::settings, "" };
         feedback.play(Cue::toggle);
@@ -1582,8 +1619,8 @@ void Dashboard::draw_market(gfx::DrawList & l, const Rect & a) const {
         const std::string plan = m.checking ? "Reading its header" : m.fits == -1 ? "Square checks whether it fits" : m.plan;
         put(l, f.regular, f.regular.font->fit(format("%.1f GB", m.bytes / 1073741824.0) + "    " + gb_text(plan), 20, a.w - 300), a.x + 28, y + 66,
              20, kInk3);
-        put(l, f.semibold, m.fits == 1 ? "Fits" : m.fits == 0 ? "Too big" : "", a.x + a.w - 28, y + 50, 22,
-             m.fits == 1 ? kInk2 : kInk3, gfx::Align::right);
+        put(l, f.semibold, m.unsupported ? "Unsupported" : m.fits == 1 ? "Fits" : m.fits == 0 ? "Too big" : "",
+             a.x + a.w - 28, y + 50, 22, m.fits == 1 ? kInk2 : kInk3, gfx::Align::right);
     }
 }
 

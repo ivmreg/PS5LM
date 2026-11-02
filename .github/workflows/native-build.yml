@@ -10,7 +10,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   host-checks:
-    name: Existing model planner and script syntax
+    name: Host regression tests and script syntax
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -21,13 +21,10 @@ jobs:
         run: |
           for script in scripts/*.sh ps5/app/ps5cc ps5/app/ps5cxx; do bash -n "$script"; done
           PYTHONPYCACHEPREFIX=build/pycache python3 -m py_compile scripts/*.py
-      - name: Build-script job limit and compiler-failure regressions
-        run: PYTHONPYCACHEPREFIX=build/pycache python3 -m unittest discover -s tests -p 'test_build_app.py' -v
-      - name: Existing synthetic GGUF model-planner regression test
-        run: |
-          mkdir -p build
-          c++ -std=c++17 -O1 ps5/app/model_plan_test.cpp ps5/app/model_plan.cpp -o build/model_plan_test
-          build/model_plan_test
+      - name: Initialize pinned sources for host integration tests
+        run: git submodule update --init --depth 1 -- third_party/llama.cpp third_party/ps5-homebrew-ui
+      - name: Run host regression suites
+        run: bash scripts/test-host.sh
 
   ps5-title:
     name: Full PS5 title cross-build and static package checks

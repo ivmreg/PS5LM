@@ -69,7 +69,8 @@ for patch in "${patches[@]}"; do
     git -C "$source_dir" apply "$patch_lf"
 done
 
-jobs="${BUILD_JOBS:-2}"
+default_jobs="$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 2)"
+jobs="${BUILD_JOBS:-$default_jobs}"
 [[ "$jobs" =~ ^[1-9][0-9]*$ ]] || die 'BUILD_JOBS must be a positive integer'
 export CMAKE_BUILD_PARALLEL_LEVEL="$jobs"
 

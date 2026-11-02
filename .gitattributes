@@ -1,0 +1,42 @@
+# Enforce LF line endings for all text files across platforms
+* text=auto eol=lf
+
+# Explicit LF line endings for code, scripts, patches, and configurations
+*.sh text eol=lf
+*.bash text eol=lf
+*.patch text eol=lf
+*.py text eol=lf
+*.cpp text eol=lf
+*.hpp text eol=lf
+*.c text eol=lf
+*.h text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.cmake text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+*.svg text eol=lf
+*.pem text eol=lf
+CMakeLists.txt text eol=lf
+.gitignore text eol=lf
+.gitmodules text eol=lf
+
+# Binary files
+*.gguf binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.zip binary
+*.a binary
+*.so binary
+*.o binary
+*.wav binary
+*.mp4 binary
+*.gif binary
+*.woff2 binary
+*.ttf binary
+*.huifont binary

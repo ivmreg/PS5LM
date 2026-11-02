@@ -8,6 +8,17 @@ v0.1.x are the upstream payload releases by cobanov.
 ## [Unreleased]
 
 ### Added
+- **Experimental bounded MoE expert paging from SSD**: on-demand streaming of routed expert weights
+  for Mixture-of-Experts models that exceed physical RAM (such as Qwen 3 MoE). The runtime
+  maintains a bounded, transactionally isolated slot cache with batched asynchronous uploads and
+  quarantining for uncertain backend transfer fences (`ps5/moe/paging_runtime.cpp`,
+  `ps5/moe/slot_cache.cpp`, `ps5/moe/expert_source.cpp`).
+- Memory planner support for fixed MoE GPU cache budgets (`--moe-cache-mib`), multi-slot upload
+  staging capacity, and validation of minimum cache requirements across layout groups before
+  launching.
+- Split engine patches for upstream llama.cpp (`patches/0010-moe-scheduler.patch`,
+  `patches/0011-moe-loader.patch`, `patches/0012-moe-cache.patch`) with an isolated CPU test runner
+  (`scripts/test-moe-engine.sh`) integrated into the host regression CI workflow.
 - **An opt-in endpoint for the model's own numbers**: `POST /v1/introspect` answers with the whole
   logit row at the positions you name, the top candidates with their probabilities, the entropy, and
   one row of a named graph tensor (`l_out`, `ffn_swiglu`, `ffn_out`, `attn_out`, `attn_norm`, `ffn_norm`,

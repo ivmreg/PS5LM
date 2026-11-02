@@ -31,7 +31,9 @@ The existing host regression suites need Bash, Python 3, a C99 compiler, and a
 C++17/C++20 compiler. The MoE engine CPU tests additionally need Git, tar, CMake
 3.14 or newer, a C and C++17 compiler (GCC or Clang), and the selected CMake
 generator's build tool (Make or Ninja). They require a POSIX host such as Linux,
-macOS, or Linux under WSL. No Vulkan SDK or GPU is needed.
+macOS, or Linux under WSL (where packages can be installed via
+`sudo apt update && sudo apt install -y cmake build-essential git`, or `uv tool install cmake`).
+No Vulkan SDK or GPU is needed.
 
 Initialize the pinned headers used by the market and settings tests, then run
 the regression script from the repository root:

@@ -393,9 +393,17 @@ PagingResult PagingRuntime::load_layer(
                     reservation.rollback();
                 }
                 if (drained == DrainOutcome::Complete) {
-                    // A submitted operation without a token cannot be fenced
-                    // individually, so this case must always be quarantined.
-                    std::terminate();
+                    // A submitted operation without a token cannot be fenced individually.
+                    // If drain_pending did not quarantine it, quarantine explicitly and poison the runtime.
+                    const QuarantinedTransferInfo zero_token_info{
+                        submission.token, assignment.key, role, assignment.slot
+                    };
+                    quarantine_.quarantine(std::move(reservation), &zero_token_info, 1);
+                    poisoned_ = true;
+                    result.status = PagingStatus::FenceUnresolved;
+                    result.transfer_token = submission.token;
+                    result.failed_key = assignment.key;
+                    result.failed_role = role;
                 }
                 return result;
             }

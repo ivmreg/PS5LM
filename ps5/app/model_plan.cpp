@@ -1065,7 +1065,8 @@ const Preset * find_preset(const ModelInfo & m) {
 }
 
 Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const char * kv_force,
-                const char * planning_profile, bool allow_paged_moe, uint32_t moe_cache_mib) {
+                const char * planning_profile, bool allow_paged_moe, uint32_t moe_cache_mib,
+                uint32_t reserve_mib) {
     Plan p;
     if (!m.ok) {
         p.why = m.error.empty() ? "model metadata is invalid" : m.error;
@@ -1099,7 +1100,8 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
     // one ubatch, so they get 2048, the size #13 ran on the console.
     const bool wide = !m.decision.empty() || !m.mmproj.empty();
     // shortcut: 0.5 GiB more compute buffer for the 2048 ubatch is a guess; measure on the console.
-    p.reserve_gib = 0.75 + p.state_gib + (m.mmproj.empty() ? 0.0 : 0.25) + (wide ? 0.5 : 0.0);
+    const double base_reserve_gib = (reserve_mib > 0 ? (double) reserve_mib : 768.0) / 1024.0;
+    p.reserve_gib = base_reserve_gib + p.state_gib + (m.mmproj.empty() ? 0.0 : 0.25) + (wide ? 0.5 : 0.0);
 
     const std::vector<PlanCandidate> candidates = enumerate_candidates(
         m, p.weights_gib, p.state_gib, p.reserve_gib, ctx_cap, kv_force, profile);

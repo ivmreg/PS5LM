@@ -79,7 +79,7 @@ constexpr int          kMarketChipCount = 7;
 
 // ---- Settings -------------------------------------------------------------------
 
-enum class Setting : int { auto_load, default_model, ctx_cap, kv_type, planning_profile, sounds, tools, introspect, paged_moe, moe_cache_mib, scratch_limit, clear_scratch, download_dir };
+enum class Setting : int { auto_load, default_model, ctx_cap, kv_type, planning_profile, reserve_mib, sounds, tools, introspect, paged_moe, moe_cache_mib, scratch_limit, clear_scratch, download_dir };
 
 struct SettingRow {
     Setting      id;
@@ -89,7 +89,7 @@ struct SettingRow {
 
 struct SettingCategory {
     const char * name;
-    SettingRow   rows[3];
+    SettingRow   rows[4];
     int          count;
 };
 
@@ -101,8 +101,9 @@ constexpr SettingCategory kCategories[] = {
     { "Model",
       { { Setting::ctx_cap, "Longest context", "The longest that fits, up to this; applies at the next load" },
         { Setting::kv_type, "Context cache", "Auto picks the best that fits; a fixed type trades length for quality" },
-        { Setting::planning_profile, "Planning profile", "Plans KV cache/context for the next load; model weights are unchanged" } },
-      3 },
+        { Setting::planning_profile, "Planning profile", "Plans KV cache/context for the next load; model weights are unchanged" },
+        { Setting::reserve_mib, "Safety threshold", "GPU memory reserved for compute buffers; lower values allow longer contexts" } },
+      4 },
     { "Chat",
       { { Setting::tools, "File tools", "The browser chat may read and write files in /data/PS5LM/scratch" },
         { Setting::scratch_limit, "Warn above", "A notification when that folder grows past this" },
@@ -128,6 +129,7 @@ constexpr int kDiagnostics = 5;
 constexpr uint32_t     kCtxSteps[] = { 4096, 8192, 16384, 32768, 65536, 131072 };
 constexpr const char * kKvSteps[] = { "auto", "f16", "q8_0", "q4_0" };
 constexpr const char * kPlanningProfileSteps[] = { "long_context", "balanced", "kv_precision" };
+constexpr uint32_t     kReserveSteps[] = { 256, 384, 512, 768, 1024 };
 constexpr uint32_t     kMoeCacheSteps[] = { 1024, 1536, 2048, 3072, 4096 };
 constexpr uint32_t     kScratchSteps[] = { 1, 2, 5, 10, 20 };
 
@@ -405,6 +407,10 @@ std::string setting_text(const Settings & s, Setting id, const std::vector<Model
         case Setting::planning_profile:
             return s.planning_profile == "balanced" ? "Balanced (16k target)"
                  : s.planning_profile == "kv_precision" ? "KV precision" : "Long context";
+        case Setting::reserve_mib:
+            return s.reserve_mib == 768 ? "768 MB (Default)"
+                 : s.reserve_mib >= 1024 ? format("%.1f GB", s.reserve_mib / 1024.0)
+                 : format("%u MB", s.reserve_mib);
         case Setting::moe_cache_mib: return format("%.1f GB", s.moe_cache_mib / 1024.0);
         case Setting::scratch_limit: return format("%.0f GB", (double) s.scratch_limit_gib);
         case Setting::download_dir: {
@@ -481,6 +487,23 @@ std::vector<Choice> choices_of(const Settings & s, Setting id, const std::vector
                 const std::string profile = kPlanningProfileSteps[i];
                 add(labels[i], notes[i], s.planning_profile == profile,
                     [profile](Settings & v) { v.planning_profile = profile; });
+            }
+            break;
+        }
+        case Setting::reserve_mib: {
+            const char * notes[] = {
+                "Minimal (fits 64k on 27B UD-Q2_K_XL)",
+                "Tight (extra room for KV cache)",
+                "Balanced headroom",
+                "Default conservative headroom",
+                "Extra safety headroom"
+            };
+            for (int i = 0; i < 5; ++i) {
+                const uint32_t m = kReserveSteps[i];
+                const std::string label = m == 768 ? "768 MB (Default)"
+                                        : m >= 1024 ? format("%.1f GB", m / 1024.0)
+                                        : format("%u MB", m);
+                add(label, notes[i], s.reserve_mib == m, [m](Settings & v) { v.reserve_mib = m; });
             }
             break;
         }

@@ -28,6 +28,13 @@ Settings load_settings(const char * path) {
             s.planning_profile = value;
         }
     }
+    const auto reserve = j.find("reserve_mib");
+    if (reserve != j.end() && reserve->is_number_unsigned()) {
+        const uint64_t val = reserve->get<uint64_t>();
+        if (val >= 128 && val <= 4096) {
+            s.reserve_mib = (uint32_t) val;
+        }
+    }
     s.sounds        = j.value("sounds", s.sounds);
     s.tools         = j.value("tools", s.tools);
     s.introspect    = j.value("introspect", s.introspect);
@@ -51,6 +58,7 @@ bool save_settings(const char * path, const Settings & s) {
     const nlohmann::json j = {
         { "auto_load", s.auto_load }, { "default_model", s.default_model }, { "ctx_cap", s.ctx_cap },
         { "kv_type", s.kv_type },     { "planning_profile", s.planning_profile },
+        { "reserve_mib", s.reserve_mib },
         { "sounds", s.sounds },       { "tools", s.tools },
         { "introspect", s.introspect },
         { "paged_moe", s.paged_moe }, { "moe_cache_mib", s.moe_cache_mib },

@@ -245,6 +245,31 @@ int main(int argc, char ** argv) {
     assert(!no_context_candidate.fits && no_context_candidate.args.empty());
     assert(std::fabs(no_context_candidate.total_gib - (5.0 + 0.75)) < 0.001);
 
+    // Safety threshold (reserve_mib) allows squeezing longer contexts when memory is tight
+    const ps5lm::Plan tight_reserve = ps5lm::plan_model(profiles, 1.0, 2048, nullptr, "long_context", false, 2048, 384);
+    assert(!tight_reserve.fits && tight_reserve.args.empty());
+    assert(std::fabs(tight_reserve.total_gib - (5.0 + 384.0 / 1024.0)) < 0.001);
+
+    // Test calibrated Qwen3.8 27B UD-Q2_K_XL on console budget of 11.03 GiB (with GUI active):
+    // 768 MiB default reserve caps context at 32k; 384 MiB safety threshold unlocks full 64k!
+    ps5lm::ModelInfo qwen38_q2k;
+    qwen38_q2k.ok = true;
+    qwen38_q2k.arch = "qwen35";
+    qwen38_q2k.name = "Qwen 3.8 27B";
+    qwen38_q2k.file_name = "Qwen3.8-27B-UD-Q2_K_XL.gguf";
+    qwen38_q2k.n_layer = 64;
+    qwen38_q2k.full_attn_every = 4;
+    qwen38_q2k.n_head_kv = 4;
+    qwen38_q2k.key_length = 256;
+    qwen38_q2k.value_length = 256;
+    qwen38_q2k.file_bytes = 9828981664ull;
+    qwen38_q2k.state_bytes = 157286400ull;
+    const double gui_budget = 11.03;
+    const ps5lm::Plan q2k_default = ps5lm::plan_model(qwen38_q2k, gui_budget, 65536, nullptr, "long_context", false, 2048, 768);
+    assert(q2k_default.fits && q2k_default.ctx == 32768 && q2k_default.kv_type == "q4_0");
+    const ps5lm::Plan q2k_tight = ps5lm::plan_model(qwen38_q2k, gui_budget, 65536, nullptr, "long_context", false, 2048, 384);
+    assert(q2k_tight.fits && q2k_tight.ctx == 65536 && q2k_tight.kv_type == "q4_0");
+
     // A forced cache type and the effective user/model/preset context ceilings
     // apply for every profile. Explicitly forced f16 may exceed the automatic
     // 8k cutoff in the legacy ordering, as it did before profiles existed.

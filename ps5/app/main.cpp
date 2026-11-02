@@ -694,7 +694,7 @@ struct Models {
                 rows.push_back(row);
                 continue;
             }
-            const Plan p = plan_model(m, budget_gib, settings.ctx_cap, kv, settings.planning_profile.c_str(), settings.paged_moe, settings.moe_cache_mib);
+            const Plan p = plan_model(m, budget_gib, settings.ctx_cap, kv, settings.planning_profile.c_str(), settings.paged_moe, settings.moe_cache_mib, settings.reserve_mib);
             const Preset * pre = find_preset(m);
             row.arch = m.arch;
             row.plan = p.why;
@@ -720,7 +720,7 @@ struct Models {
     // The arguments for a model: the planner's, or app-args.txt's verbatim.
     std::vector<std::string> args_for(const std::string & path, Live & model_part) {
         const ModelInfo m = read_model_info(path);
-        const Plan p = plan_model(m, budget_gib, settings.ctx_cap, kv_force(), settings.planning_profile.c_str(), settings.paged_moe, settings.moe_cache_mib);
+        const Plan p = plan_model(m, budget_gib, settings.ctx_cap, kv_force(), settings.planning_profile.c_str(), settings.paged_moe, settings.moe_cache_mib, settings.reserve_mib);
         const Preset * pre = find_preset(m);
         model_part.model_label = base_name(path);
         model_part.model_file  = path;
@@ -1193,6 +1193,7 @@ int main(int, char **) {
             save_settings(kSettings, models.settings);
             if (was.ctx_cap != models.settings.ctx_cap || was.kv_type != models.settings.kv_type ||
                 was.planning_profile != models.settings.planning_profile ||
+                was.reserve_mib != models.settings.reserve_mib ||
                 was.paged_moe != models.settings.paged_moe || was.moe_cache_mib != models.settings.moe_cache_mib) {
                 models.rescan(stats);
             }

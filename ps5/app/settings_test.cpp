@@ -33,11 +33,13 @@ int main() {
     assert(defaults.planning_profile == "long_context");
     assert(defaults.paged_moe == false);
     assert(defaults.moe_cache_mib == 2048);
+    assert(defaults.reserve_mib == 768);
     write_text(path, "{}\n");
     const ps5lm::Settings empty_loaded = ps5lm::load_settings(path.c_str());
     assert(empty_loaded.planning_profile == "long_context");
     assert(empty_loaded.paged_moe == false);
     assert(empty_loaded.moe_cache_mib == 2048);
+    assert(empty_loaded.reserve_mib == 768);
 
     for (const char * name : { "long_context", "balanced", "kv_precision" }) {
         ps5lm::Settings expected;
@@ -46,11 +48,13 @@ int main() {
         expected.ctx_cap = 32768;
         expected.paged_moe = true;
         expected.moe_cache_mib = 4096;
+        expected.reserve_mib = 384;
         assert(ps5lm::save_settings(path.c_str(), expected));
         const ps5lm::Settings loaded = ps5lm::load_settings(path.c_str());
         assert(loaded == expected);
         assert(loaded.paged_moe == true);
         assert(loaded.moe_cache_mib == 4096);
+        assert(loaded.reserve_mib == 384);
     }
 
     write_text(path, "{\"planning_profile\":\"future-policy\"}\n");
@@ -87,6 +91,24 @@ int main() {
     assert(ps5lm::load_settings(path.c_str()).moe_cache_mib == 128);
     write_text(path, "{\"moe_cache_mib\":8192}\n");
     assert(ps5lm::load_settings(path.c_str()).moe_cache_mib == 8192);
+
+    // Malformed and out-of-range reserve_mib tests
+    write_text(path, "{\"reserve_mib\":0}\n");
+    assert(ps5lm::load_settings(path.c_str()).reserve_mib == 768);
+    write_text(path, "{\"reserve_mib\":64}\n");
+    assert(ps5lm::load_settings(path.c_str()).reserve_mib == 768);
+    write_text(path, "{\"reserve_mib\":8192}\n");
+    assert(ps5lm::load_settings(path.c_str()).reserve_mib == 768);
+    write_text(path, "{\"reserve_mib\":\"384\"}\n");
+    assert(ps5lm::load_settings(path.c_str()).reserve_mib == 768);
+    write_text(path, "{\"reserve_mib\":null}\n");
+    assert(ps5lm::load_settings(path.c_str()).reserve_mib == 768);
+
+    // Valid range boundary checks for reserve_mib
+    write_text(path, "{\"reserve_mib\":128}\n");
+    assert(ps5lm::load_settings(path.c_str()).reserve_mib == 128);
+    write_text(path, "{\"reserve_mib\":4096}\n");
+    assert(ps5lm::load_settings(path.c_str()).reserve_mib == 4096);
 
     std::remove(path.c_str());
     std::puts("settings_test: ok (defaults, validation and profile round trips)");

@@ -16,6 +16,7 @@ struct Settings {
     uint32_t    ctx_cap   = 65536;  // the planner's longest context
     std::string kv_type   = "auto"; // "auto", "f16", "q8_0" or "q4_0"
     std::string planning_profile = "long_context"; // "long_context", "balanced" or "kv_precision"
+    uint32_t    reserve_mib = 768;  // GPU compute buffer safety headroom in MiB (default 768 MiB = 0.75 GiB)
     bool        sounds    = true;
     bool        tools     = true;   // file tools in the browser chat, inside the scratch folder
     bool        introspect = false;  // POST /v1/introspect: raw logits and activations (off by default)

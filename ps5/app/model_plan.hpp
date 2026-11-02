@@ -99,7 +99,8 @@ struct Plan {
 // is a fixed requested budget; the planner does not shrink it to make a plan fit.
 Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap = 65536,
                 const char * kv_force = nullptr, const char * planning_profile = "long_context",
-                bool allow_paged_moe = false, uint32_t moe_cache_mib = 2048);
+                bool allow_paged_moe = false, uint32_t moe_cache_mib = 2048,
+                uint32_t reserve_mib = 768);
 
 // Every .gguf in the given folders (not recursive), sorted by name. Split
 // files are listed by their first part only.

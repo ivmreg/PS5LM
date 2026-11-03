@@ -31,6 +31,12 @@ struct Gguf {
     Gguf & array(const std::string & k, uint32_t elem_type, uint64_t count) {
         kvs += str(k) + raw<uint32_t>(9) + raw(elem_type) + raw(count); n++; return *this;
     }
+    Gguf & array_empty_strings(const std::string & k, uint64_t count) {
+        kvs += str(k) + raw<uint32_t>(9) + raw<uint32_t>(8) + raw(count);
+        kvs.append(count * sizeof(uint64_t), '\0');
+        n++;
+        return *this;
+    }
     Gguf & tensor(const std::string & name, const std::vector<uint64_t> & dims, uint32_t type, uint64_t offset = 0) {
         tensors_data += str(name) + raw<uint32_t>((uint32_t) dims.size());
         for (uint64_t d : dims) tensors_data += raw<uint64_t>(d);
@@ -476,6 +482,135 @@ int main(int argc, char ** argv) {
     std::remove(first_path.c_str());
     std::remove(second_path.c_str());
     rmdir(dir.c_str());
+
+    // --- Speculative decoding and MTP planning tests ---
+    Gguf mtp_gguf;
+    add_qwen35(mtp_gguf);
+    mtp_gguf.kv("qwen35.nextn_predict_layers", 1u);
+    mtp_gguf.kv("tokenizer.ggml.model", "qwen2");
+    mtp_gguf.array_empty_strings("tokenizer.ggml.tokens", 152064u);
+    const ps5lm::ModelInfo mtp_info = ps5lm::read_model_header("qwen-mtp", mtp_gguf.bytes(), 5300000000ull);
+    assert(mtp_info.ok);
+    assert(mtp_info.n_layer == 31);
+    assert(mtp_info.n_mtp_layers == 1);
+    assert(mtp_info.mtp_bytes > 0);
+    assert(mtp_info.tokenizer_model == "qwen2");
+    assert(mtp_info.vocab_size == 152064);
+
+    // Malformed MTP metadata: nextn layers exceed block count
+    Gguf bad_mtp_gguf;
+    add_qwen35(bad_mtp_gguf);
+    bad_mtp_gguf.kv("qwen35.nextn_predict_layers", 40u);
+    const ps5lm::ModelInfo bad_mtp_info = ps5lm::read_model_header("bad-mtp", bad_mtp_gguf.bytes(), 5300000000ull);
+    assert(!bad_mtp_info.ok);
+
+    // Golden vector comparison: spec=nullptr vs spec->mode="off"
+    const ps5lm::Plan golden_plan = ps5lm::plan_model(mtp_info, 11.0);
+    assert(golden_plan.fits);
+    assert(golden_plan.spec_mode == "off");
+    assert(golden_plan.spec_gib == 0.0);
+
+    ps5lm::SpecOptions spec_off;
+    spec_off.mode = "off";
+    const ps5lm::Plan off_plan = ps5lm::plan_model(mtp_info, 11.0, 65536, nullptr, "long_context", false, 2048, 768, &spec_off);
+    assert(off_plan.fits);
+    assert(off_plan.args == golden_plan.args);
+    assert(off_plan.why == golden_plan.why);
+
+    // MTP planning (mode = "mtp")
+    ps5lm::SpecOptions spec_mtp;
+    spec_mtp.mode = "mtp";
+    spec_mtp.draft_max = 8;
+    spec_mtp.draft_min = 1;
+    const ps5lm::Plan mtp_plan = ps5lm::plan_model(mtp_info, 11.0, 65536, nullptr, "long_context", false, 2048, 768, &spec_mtp);
+    assert(mtp_plan.fits);
+    assert(mtp_plan.spec_mode == "mtp");
+    assert(mtp_plan.spec_gib > 0.0);
+    assert(std::find(mtp_plan.args.begin(), mtp_plan.args.end(), "--spec-type") != mtp_plan.args.end());
+    assert(std::find(mtp_plan.args.begin(), mtp_plan.args.end(), "draft-mtp") != mtp_plan.args.end());
+    assert(std::find(mtp_plan.args.begin(), mtp_plan.args.end(), "--draft-max") != mtp_plan.args.end());
+    assert(has_args(mtp_plan, "-ctkd", mtp_plan.kv_type.c_str()));
+    assert(has_args(mtp_plan, "-ctvd", mtp_plan.kv_type.c_str()));
+
+    // Sidecar MTP planning
+    ps5lm::SpecOptions spec_mtp_sidecar;
+    spec_mtp_sidecar.mode = "mtp";
+    spec_mtp_sidecar.draft_path = "/data/PS5LM/models/qwen35-mtp.gguf";
+    spec_mtp_sidecar.draft_bytes = 400000000ull;
+    const ps5lm::Plan mtp_sidecar_plan = ps5lm::plan_model(mtp_info, 11.0, 65536, nullptr, "long_context", false, 2048, 768, &spec_mtp_sidecar);
+    assert(mtp_sidecar_plan.fits);
+    assert(mtp_sidecar_plan.spec_mode == "mtp");
+    assert(has_args(mtp_sidecar_plan, "-md", "/data/PS5LM/models/qwen35-mtp.gguf"));
+    assert(has_args(mtp_sidecar_plan, "--spec-draft-ngl", "999"));
+    assert(has_args(mtp_sidecar_plan, "-ctkd", mtp_sidecar_plan.kv_type.c_str()));
+    assert(has_args(mtp_sidecar_plan, "-ctvd", mtp_sidecar_plan.kv_type.c_str()));
+
+    // Recurrent state rollback accounting in MTP
+    ps5lm::ModelInfo recurrent_mtp = mtp_info;
+    recurrent_mtp.state_bytes = 200ull * 1024 * 1024; // 200 MiB state
+    const ps5lm::Plan rec_mtp_plan = ps5lm::plan_model(recurrent_mtp, 11.0, 65536, nullptr, "long_context", false, 2048, 768, &spec_mtp);
+    assert(rec_mtp_plan.fits);
+    // draft_max = 8, so 8 * 200 MiB = 1600 MiB (~1.56 GiB) extra spec memory
+    assert(rec_mtp_plan.spec_gib > 1.6);
+
+    // Auto mode with MTP model resolves to MTP
+    ps5lm::SpecOptions spec_auto;
+    spec_auto.mode = "auto";
+    const ps5lm::Plan auto_plan = ps5lm::plan_model(mtp_info, 11.0, 65536, nullptr, "long_context", false, 2048, 768, &spec_auto);
+    assert(auto_plan.fits);
+    assert(auto_plan.spec_mode == "mtp");
+
+    // Draft model planning (mode = "draft")
+    ps5lm::SpecOptions spec_draft;
+    spec_draft.mode = "draft";
+    spec_draft.draft_path = "/data/PS5LM/models/draft-0.8b.gguf";
+    spec_draft.draft_bytes = 600000000ull;  // ~0.56 GiB
+    spec_draft.draft_max = 6;
+    spec_draft.draft_min = 2;
+    const ps5lm::Plan draft_plan = ps5lm::plan_model(mtp_info, 11.0, 65536, nullptr, "long_context", false, 2048, 768, &spec_draft);
+    assert(draft_plan.fits);
+    assert(draft_plan.spec_mode == "draft");
+    assert(draft_plan.spec_gib > 0.6);
+    assert(std::find(draft_plan.args.begin(), draft_plan.args.end(), "-md") != draft_plan.args.end());
+    assert(std::find(draft_plan.args.begin(), draft_plan.args.end(), "/data/PS5LM/models/draft-0.8b.gguf") != draft_plan.args.end());
+    assert(std::find(draft_plan.args.begin(), draft_plan.args.end(), "--spec-draft-ngl") != draft_plan.args.end());
+    assert(std::find(draft_plan.args.begin(), draft_plan.args.end(), "999") != draft_plan.args.end());
+    assert(has_args(draft_plan, "-ctkd", draft_plan.kv_type.c_str()));
+    assert(has_args(draft_plan, "-ctvd", draft_plan.kv_type.c_str()));
+
+    // Spec dropped when memory is tight:
+    // With 6.2 GiB budget, model weights (4.94 GiB) + reserve (0.875 GiB) + 1k KV (~0.05 GiB) fits without draft (total ~5.87 GiB),
+    // but with draft (+ ~0.7 GiB) total is ~6.57 GiB > 6.2 GiB.
+    const ps5lm::Plan tight_plan = ps5lm::plan_model(mtp_info, 6.2, 65536, nullptr, "long_context", false, 2048, 768, &spec_draft);
+    assert(tight_plan.fits);
+    assert(tight_plan.spec_mode == "off");
+    assert(tight_plan.spec_gib == 0.0);
+    assert(tight_plan.why.find("spec dropped: tight memory") != std::string::npos);
+    assert(std::find(tight_plan.args.begin(), tight_plan.args.end(), "-md") == tight_plan.args.end());
+
+    // Context shrinks before spec dropped:
+    // With 7.0 GiB budget, 64k or 32k with draft doesn't fit, but a lower context (e.g. 4k or 8k) with draft fits!
+    const ps5lm::Plan shrink_plan = ps5lm::plan_model(mtp_info, 7.0, 65536, nullptr, "long_context", false, 2048, 768, &spec_draft);
+    assert(shrink_plan.fits);
+    assert(shrink_plan.spec_mode == "draft");
+    assert(shrink_plan.ctx < 65536);
+
+    // MTP sidecar discovery test
+    char mtp_template[] = "/tmp/ps5lm-mtp-test-XXXXXX";
+    char * mtp_temp = mkdtemp(mtp_template);
+    assert(mtp_temp != nullptr);
+    const std::string mtp_dir = mtp_temp;
+    const std::string target_path = mtp_dir + "/qwen35-9b-q4_k_m.gguf";
+    const std::string sidecar_path = mtp_dir + "/qwen35-9b-mtp-f16.gguf";
+    write_file(target_path, mtp_gguf.bytes(), 7);
+    write_file(sidecar_path, mtp_gguf.bytes(), 7);
+    assert(ps5lm::find_mtp(target_path) == sidecar_path);
+    const std::vector<std::string> found_in_mtp_dir = ps5lm::find_models({ mtp_dir });
+    assert(found_in_mtp_dir.size() == 1);
+    assert(found_in_mtp_dir[0] == target_path);
+    std::remove(target_path.c_str());
+    std::remove(sidecar_path.c_str());
+    rmdir(mtp_dir.c_str());
 
     if (argc > 1) {
         bool saw_q2k = false, saw_iq2xxs = false;

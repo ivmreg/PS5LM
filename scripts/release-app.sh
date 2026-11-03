@@ -25,7 +25,11 @@ grep -q "\"contentVersion\": \"$content\"" "$root/ps5/app/sce_sys/param.json" ||
     { echo "release-app: set contentVersion to $content in ps5/app/sce_sys/param.json" >&2; exit 1; }
 mkdir -p "$out"
 rm -f "$zip"
-(cd "$(dirname "$app")" && zip -qr -X "$zip" "$title")
+if command -v zip >/dev/null; then
+    (cd "$(dirname "$app")" && zip -qr -X "$zip" "$title")
+else
+    python3 -c 'import sys, zipfile, pathlib; p = pathlib.Path(sys.argv[2]); zf = zipfile.ZipFile(sys.argv[1], "w", zipfile.ZIP_DEFLATED); [zf.write(f, f.relative_to(p.parent)) for f in sorted(p.rglob("*")) if f.is_file()]; zf.close()' "$zip" "$app"
+fi
 (cd "$out" && sha256sum "$(basename "$zip")" > "$(basename "$zip").sha256")
 echo "release-app: $zip ($(du -h "$zip" | cut -f1))"
 cat "$zip.sha256"

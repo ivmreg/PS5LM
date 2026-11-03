@@ -375,6 +375,46 @@ std::string find_mmproj(const std::string & model_path) {
     return best;
 }
 
+// The MTP head sidecar for a model: an "mtp" .gguf in the same folder.
+std::string find_mtp(const std::string & model_path) {
+    const std::string dir = dirname(model_path);
+    const auto key = [](std::string n) {
+        n = lower(n);
+        if (const size_t at = n.find("mtp"); at != std::string::npos) {
+            n.erase(at, 3);
+        }
+        n.erase(std::remove_if(n.begin(), n.end(), [](char c) { return c == '-' || c == '_' || c == '.'; }), n.end());
+        return n;
+    };
+    const std::string want = key(basename(model_path));
+    std::string best;
+    size_t      best_len = 0;
+    DIR * d = opendir(dir.c_str());
+    if (!d) {
+        return best;
+    }
+    while (dirent * e = readdir(d)) {
+        const std::string n = e->d_name;
+        if (lower(n).find("mtp") == std::string::npos || n.size() < 6 || lower(n.substr(n.size() - 5)) != ".gguf") {
+            continue;
+        }
+        if (join_path(dir, n) == model_path) {
+            continue;
+        }
+        const std::string k = key(n);
+        size_t common = 0;
+        while (common < k.size() && common < want.size() && k[common] == want[common]) {
+            ++common;
+        }
+        if (common >= 4 && common > best_len) {
+            best = join_path(dir, n);
+            best_len = common;
+        }
+    }
+    closedir(d);
+    return best;
+}
+
 namespace {
 
 // Reads a bounded GGUF header from `f` (and closes it). `file_bytes` is the
@@ -413,7 +453,7 @@ ModelInfo parse_model_info(Reader r, const std::string & path, uint64_t file_byt
         return m;
     }
 
-    std::map<std::string, uint64_t> ints;
+    std::map<std::string, uint64_t> ints, array_lens;
     std::map<std::string, std::string> strs;
     std::map<std::string, uint32_t> types, array_types;
     std::set<std::string> keys;
@@ -435,6 +475,7 @@ ModelInfo parse_model_info(Reader r, const std::string & path, uint64_t file_byt
                 break;
             }
             array_types[key] = et;
+            array_lens[key]  = n;
             if (et == STRING) {
                 for (uint64_t j = 0; j < n && !r.bad; j++) {
                     const uint64_t len = r.get<uint64_t>();
@@ -549,6 +590,11 @@ ModelInfo parse_model_info(Reader r, const std::string & path, uint64_t file_byt
         return m;
     }
     m.arch = strs["general.architecture"];
+    m.tokenizer_model = strs["tokenizer.ggml.model"];
+    if (array_lens.count("tokenizer.ggml.tokens")) {
+        const uint64_t v = array_lens["tokenizer.ggml.tokens"];
+        m.vocab_size = v <= UINT32_MAX ? (uint32_t) v : 0;
+    }
     if (!strs["general.name"].empty()) {
         m.name = strs["general.name"];
     }
@@ -587,6 +633,7 @@ ModelInfo parse_model_info(Reader r, const std::string & path, uint64_t file_byt
     const uint64_t nextn = num("nextn_predict_layers");
     if (nextn > blocks || blocks - nextn > UINT32_MAX) shape_bad = true;
     m.n_layer         = nextn <= blocks && blocks - nextn <= UINT32_MAX ? (uint32_t) (blocks - nextn) : 0;
+    m.n_mtp_layers    = nextn <= blocks && nextn <= UINT32_MAX ? (uint32_t) nextn : 0;
     const uint64_t n_head = num("attention.head_count");
     const uint64_t n_head_kv = num("attention.head_count_kv", n_head);
     const uint64_t n_embd = num("embedding_length");
@@ -697,6 +744,10 @@ ModelInfo parse_model_info(Reader r, const std::string & path, uint64_t file_byt
                 !checked_mul(nb2, nbytes, nbytes)) {
                 dir_ok = false;
                 break;
+            }
+            const bool is_mtp = (tname.rfind("nextn.", 0) == 0) || (tname.find(".nextn.") != std::string::npos);
+            if (is_mtp) {
+                m.mtp_bytes += nbytes;
             }
             tensors.push_back({ std::move(tname), n_dims, { ne[0], ne[1], ne[2], ne[3] }, type, offset, row_bytes, nb2, nbytes });
         }
@@ -888,6 +939,11 @@ ModelInfo parse_model_info(Reader r, const std::string & path, uint64_t file_byt
         }
     }
 
+    if (m.n_mtp_layers > 0 && m.mtp_bytes == 0 && m.n_layer > 0) {
+        // Estimated when tensor directory is absent or not parsed
+        m.mtp_bytes = (m.file_bytes / (m.n_layer + m.n_mtp_layers)) * m.n_mtp_layers;
+    }
+
     if (f) {
         std::fclose(f);
     }
@@ -944,6 +1000,7 @@ ModelInfo read_model_info(const std::string & path) {
         struct stat st = {};
         m.mmproj_bytes = stat(m.mmproj.c_str(), &st) == 0 ? (uint64_t) st.st_size : 0;
     }
+    m.mtp_sidecar = find_mtp(path);
     if (!m.ok) return m;
 
     const SplitName hint = split_name(path);
@@ -1066,7 +1123,7 @@ const Preset * find_preset(const ModelInfo & m) {
 
 Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const char * kv_force,
                 const char * planning_profile, bool allow_paged_moe, uint32_t moe_cache_mib,
-                uint32_t reserve_mib) {
+                uint32_t reserve_mib, const SpecOptions * spec) {
     Plan p;
     if (!m.ok) {
         p.why = m.error.empty() ? "model metadata is invalid" : m.error;
@@ -1103,13 +1160,114 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
     const double base_reserve_gib = (reserve_mib > 0 ? (double) reserve_mib : 768.0) / 1024.0;
     p.reserve_gib = base_reserve_gib + p.state_gib + (m.mmproj.empty() ? 0.0 : 0.25) + (wide ? 0.5 : 0.0);
 
+    std::string req_spec_mode = "off";
+    std::string spec_draft_path;
+    uint64_t spec_draft_bytes = 0;
+    uint32_t draft_max = 8;
+    uint32_t draft_min = 1;
+
+    if (spec) {
+        draft_max = spec->draft_max ? spec->draft_max : 8;
+        draft_min = spec->draft_min ? spec->draft_min : 1;
+        if (spec->mode == "auto") {
+            if (m.n_mtp_layers > 0 || !m.mtp_sidecar.empty()) {
+                req_spec_mode = "mtp";
+                if (m.n_mtp_layers == 0 && !m.mtp_sidecar.empty()) {
+                    spec_draft_path = m.mtp_sidecar;
+                }
+            } else if (!spec->draft_path.empty()) {
+                req_spec_mode = "draft";
+                spec_draft_path = spec->draft_path;
+                spec_draft_bytes = spec->draft_bytes;
+            } else {
+                req_spec_mode = "off";
+            }
+        } else if (spec->mode == "mtp") {
+            if (m.n_mtp_layers > 0 || !m.mtp_sidecar.empty() || !spec->draft_path.empty()) {
+                req_spec_mode = "mtp";
+                if (!spec->draft_path.empty()) {
+                    spec_draft_path = spec->draft_path;
+                    spec_draft_bytes = spec->draft_bytes;
+                } else if (!m.mtp_sidecar.empty()) {
+                    spec_draft_path = m.mtp_sidecar;
+                }
+            } else {
+                req_spec_mode = "off";
+            }
+        } else if (spec->mode == "draft") {
+            if (!spec->draft_path.empty()) {
+                req_spec_mode = "draft";
+                spec_draft_path = spec->draft_path;
+                spec_draft_bytes = spec->draft_bytes;
+            } else {
+                req_spec_mode = "off";
+            }
+        }
+    }
+
+    if (!spec_draft_path.empty() && spec_draft_bytes == 0) {
+        struct stat st = {};
+        if (stat(spec_draft_path.c_str(), &st) == 0 && st.st_size > 0) {
+            spec_draft_bytes = (uint64_t) st.st_size;
+        }
+    }
+
+    auto calc_spec_gib = [&](uint32_t ctx, const std::string & kv_type, double base_kv_gib) -> double {
+        if (req_spec_mode == "off") return 0.0;
+        const double per_elem = kv_type == "f16" ? 2.0 : kv_type == "q8_0" ? 34.0 / 32 : 18.0 / 32;
+        if (req_spec_mode == "mtp") {
+            const double extra_weights = spec_draft_path.empty() ? 0.0 : ((double) spec_draft_bytes / kGiB);
+            const uint32_t mtp_heads = std::max<uint32_t>(1, m.n_mtp_layers);
+            const double mtp_kv_bytes_per_tok = (double) mtp_heads * m.n_head_kv * ((double) m.key_length + (double) m.value_length) * per_elem;
+            const double mtp_kv_gib = ((double) ctx * mtp_kv_bytes_per_tok) / kGiB;
+            // Recurrent state rollback: when MTP is enabled, llama.cpp allocates n_rs_seq = draft_max
+            // recurrent state copies for rollback (cache_r_l%d, cache_s_l%d), multiplying m.state_bytes.
+            const double rs_rollback_gib = (p.state_gib > 0.0) ? ((double) draft_max * p.state_gib) : 0.0;
+            return extra_weights + mtp_kv_gib + rs_rollback_gib + 0.125;
+        }
+        if (req_spec_mode == "draft") {
+            const double draft_weights = (double) spec_draft_bytes / kGiB;
+            const double draft_kv = std::max(0.01, base_kv_gib * std::min(0.5, (double) spec_draft_bytes / std::max<uint64_t>(1, m.file_bytes)));
+            return draft_weights + draft_kv + 0.125;
+        }
+        return 0.0;
+    };
+
     const std::vector<PlanCandidate> candidates = enumerate_candidates(
         m, p.weights_gib, p.state_gib, p.reserve_gib, ctx_cap, kv_force, profile);
     const PlanCandidate * selected = nullptr;
-    for (const PlanCandidate & candidate : candidates) {
-        if (candidate.total_gib <= budget_gib) {
-            selected = &candidate;
-            break;
+    std::string chosen_spec_mode = "off";
+    double chosen_spec_gib = 0.0;
+    bool spec_dropped_tight = false;
+
+    if (req_spec_mode != "off") {
+        for (const PlanCandidate & candidate : candidates) {
+            const double s_gib = calc_spec_gib(candidate.ctx, candidate.kv_type, candidate.kv_gib);
+            if (candidate.total_gib + s_gib <= budget_gib) {
+                selected = &candidate;
+                chosen_spec_mode = req_spec_mode;
+                chosen_spec_gib = s_gib;
+                break;
+            }
+        }
+        if (!selected) {
+            // Did not fit with speculation; try without speculation
+            for (const PlanCandidate & candidate : candidates) {
+                if (candidate.total_gib <= budget_gib) {
+                    selected = &candidate;
+                    chosen_spec_mode = "off";
+                    chosen_spec_gib = 0.0;
+                    spec_dropped_tight = true;
+                    break;
+                }
+            }
+        }
+    } else {
+        for (const PlanCandidate & candidate : candidates) {
+            if (candidate.total_gib <= budget_gib) {
+                selected = &candidate;
+                break;
+            }
         }
     }
 
@@ -1118,11 +1276,23 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
         p.ctx = selected->ctx;
         p.kv_type = selected->kv_type;
         p.kv_gib = selected->kv_gib;
-        p.total_gib = selected->total_gib;
-        char why[160];
-        std::snprintf(why, sizeof(why), "%s%uk context, %s cache%s: %.1f of %.1f GiB",
+        p.spec_mode = chosen_spec_mode;
+        p.spec_gib = chosen_spec_gib;
+        p.total_gib = selected->total_gib + chosen_spec_gib;
+
+        std::string spec_tag;
+        if (p.spec_mode == "mtp") {
+            spec_tag = ", MTP";
+        } else if (p.spec_mode == "draft") {
+            spec_tag = ", draft";
+        } else if (spec_dropped_tight) {
+            spec_tag = " (spec dropped: tight memory)";
+        }
+
+        char why[200];
+        std::snprintf(why, sizeof(why), "%s%uk context, %s cache%s%s: %.1f of %.1f GiB",
                       m.decision.empty() ? "" : ("decision model (" + m.decision + "), ").c_str(), p.ctx / 1024,
-                      p.kv_type.c_str(), m.mmproj.empty() ? "" : ", images", p.total_gib, budget_gib);
+                      p.kv_type.c_str(), m.mmproj.empty() ? "" : ", images", spec_tag.c_str(), p.total_gib, budget_gib);
         p.why = why;
 
         p.args = { "-m", m.path, "-ngl", "999", "-fit", "off", "-lm", "none",
@@ -1134,6 +1304,18 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
                    "--host", "0.0.0.0", "--port", "8081" };
         if (!m.mmproj.empty()) {
             p.args.insert(p.args.end(), { "--mmproj", m.mmproj });
+        }
+        if (p.spec_mode == "mtp") {
+            p.args.insert(p.args.end(), { "--spec-type", "draft-mtp" });
+            if (!spec_draft_path.empty()) {
+                p.args.insert(p.args.end(), { "-md", spec_draft_path, "--spec-draft-ngl", "999" });
+            }
+            p.args.insert(p.args.end(), { "-ctkd", p.kv_type, "-ctvd", p.kv_type,
+                                          "--draft-max", std::to_string(draft_max), "--draft-min", std::to_string(draft_min) });
+        } else if (p.spec_mode == "draft") {
+            p.args.insert(p.args.end(), { "-md", spec_draft_path, "--spec-draft-ngl", "999",
+                                          "-ctkd", p.kv_type, "-ctvd", p.kv_type,
+                                          "--draft-max", std::to_string(draft_max), "--draft-min", std::to_string(draft_min) });
         }
         if (preset) {
             p.args.insert(p.args.end(), preset->args.begin(), preset->args.end());
@@ -1270,8 +1452,8 @@ std::vector<std::string> find_models(const std::vector<std::string> & dirs) {
             if (split.present && (!split.valid || split.index != 1)) {
                 continue;
             }
-            // Vision projectors are not models on their own.
-            if (lower(n).find("mmproj") != std::string::npos) {
+            // Vision projectors and MTP sidecars are not models on their own.
+            if (lower(n).find("mmproj") != std::string::npos || lower(n).find("mtp") != std::string::npos) {
                 continue;
             }
             out.push_back(d + "/" + n);

@@ -46,6 +46,7 @@
 #include "display.hpp"
 #include "ggml-backend.h"
 #include "model_plan.hpp"
+#include "probe.hpp"
 #include "settings.hpp"
 #include "stats.hpp"
 #include "storage_probe.h"
@@ -668,6 +669,43 @@ struct Models {
         return scan_state != 0;
     }
 
+    static SpecOptions build_spec_options(const Settings & settings, const ModelInfo & target_model) {
+        SpecOptions spec;
+        spec.mode = settings.speculative;
+        spec.draft_max = settings.draft_max;
+        if (settings.speculative == "draft" && !settings.draft_model.empty()) {
+            if (settings.draft_model == target_model.path) {
+                std::printf("ps5lm-app: draft model cannot be target model itself (%s)\n", settings.draft_model.c_str());
+                spec.mode = "off";
+            } else {
+                const ModelInfo dm = read_model_info(settings.draft_model);
+                if (!dm.ok) {
+                    std::printf("ps5lm-app: draft model %s is invalid: %s\n", settings.draft_model.c_str(), dm.error.c_str());
+                    spec.mode = "off";
+                } else if (!dm.decision.empty()) {
+                    std::printf("ps5lm-app: draft model %s is a decision model\n", settings.draft_model.c_str());
+                    spec.mode = "off";
+                } else if (dm.n_expert > 0) {
+                    std::printf("ps5lm-app: draft model %s is an MoE model (draft models must be dense)\n", settings.draft_model.c_str());
+                    spec.mode = "off";
+                } else if (dm.file_bytes > 1717986918ULL) {
+                    std::printf("ps5lm-app: draft model %s exceeds 1.6 GiB limit\n", settings.draft_model.c_str());
+                    spec.mode = "off";
+                } else if (!target_model.tokenizer_model.empty() && !dm.tokenizer_model.empty() && target_model.tokenizer_model != dm.tokenizer_model) {
+                    std::printf("ps5lm-app: draft tokenizer (%s) != target (%s)\n", dm.tokenizer_model.c_str(), target_model.tokenizer_model.c_str());
+                    spec.mode = "off";
+                } else if (target_model.vocab_size > 0 && dm.vocab_size > 0 && target_model.vocab_size != dm.vocab_size) {
+                    std::printf("ps5lm-app: draft vocab (%u) != target (%u)\n", dm.vocab_size, target_model.vocab_size);
+                    spec.mode = "off";
+                } else {
+                    spec.draft_path = settings.draft_model;
+                    spec.draft_bytes = dm.file_bytes;
+                }
+            }
+        }
+        return spec;
+    }
+
     static std::vector<ModelRow> plan_rows(const Settings & settings, double budget_gib, const std::string & running) {
         std::vector<ModelRow> rows;
         const char * kv = settings.kv_type == "auto" ? nullptr : settings.kv_type.c_str();
@@ -694,7 +732,9 @@ struct Models {
                 rows.push_back(row);
                 continue;
             }
-            const Plan p = plan_model(m, budget_gib, settings.ctx_cap, kv, settings.planning_profile.c_str(), settings.paged_moe, settings.moe_cache_mib, settings.reserve_mib);
+            const SpecOptions spec_opts = build_spec_options(settings, m);
+            const Plan p = plan_model(m, budget_gib, settings.ctx_cap, kv, settings.planning_profile.c_str(),
+                                      settings.paged_moe, settings.moe_cache_mib, settings.reserve_mib, &spec_opts);
             const Preset * pre = find_preset(m);
             row.arch = m.arch;
             row.plan = p.why;
@@ -720,7 +760,9 @@ struct Models {
     // The arguments for a model: the planner's, or app-args.txt's verbatim.
     std::vector<std::string> args_for(const std::string & path, Live & model_part) {
         const ModelInfo m = read_model_info(path);
-        const Plan p = plan_model(m, budget_gib, settings.ctx_cap, kv_force(), settings.planning_profile.c_str(), settings.paged_moe, settings.moe_cache_mib, settings.reserve_mib);
+        const SpecOptions spec_opts = build_spec_options(settings, m);
+        const Plan p = plan_model(m, budget_gib, settings.ctx_cap, kv_force(), settings.planning_profile.c_str(),
+                                  settings.paged_moe, settings.moe_cache_mib, settings.reserve_mib, &spec_opts);
         const Preset * pre = find_preset(m);
         model_part.model_label = base_name(path);
         model_part.model_file  = path;
@@ -733,6 +775,7 @@ struct Models {
         model_part.ctx         = p.ctx;
         model_part.kv_type     = p.kv_type;
         model_part.kv_gib      = p.kv_gib;
+        model_part.spec_mode   = p.spec_mode;
         return p.fits ? p.args : std::vector<std::string>{};
     }
 
@@ -1194,7 +1237,9 @@ int main(int, char **) {
             if (was.ctx_cap != models.settings.ctx_cap || was.kv_type != models.settings.kv_type ||
                 was.planning_profile != models.settings.planning_profile ||
                 was.reserve_mib != models.settings.reserve_mib ||
-                was.paged_moe != models.settings.paged_moe || was.moe_cache_mib != models.settings.moe_cache_mib) {
+                was.paged_moe != models.settings.paged_moe || was.moe_cache_mib != models.settings.moe_cache_mib ||
+                was.speculative != models.settings.speculative || was.draft_model != models.settings.draft_model ||
+                was.draft_max != models.settings.draft_max) {
                 models.rescan(stats);
             }
             std::printf("ps5lm-app: settings saved\n");
@@ -1259,12 +1304,37 @@ int main(int, char **) {
             notify("PS5LM: scratch folder cleared");
             std::printf("ps5lm-app: scratch folder cleared\n");
         }
+        if (req.kind == Dashboard::Request::probe_console) {
+            if (!models.running.empty() || models.server_started) {
+                notify("Unload the current model before probing the console.");
+            } else {
+                cancel_storage_probe("console probe");
+                dash.set_busy("Probing this console", "Measuring memory and bandwidth...");
+                if (ui_ok) {
+                    render();
+                    display.swap();
+                }
+                ProbeReport rep = run_console_probe([&](const char * phase) {
+                    std::printf("ps5lm-app: probe: %s\n", phase);
+                });
+                std::string err;
+                if (!write_probe_report("/data/PS5LM/probe.json", rep, &err)) {
+                    std::printf("ps5lm-app: probe report failed: %s\n", err.c_str());
+                }
+                notify("Console probe saved to /data/PS5LM/probe.json. Restarting...");
+                std::ofstream(kChoice) << "none\n";
+                dash.set_busy("Console probe complete", "The app restarts without a model");
+                restart_at = n + 3;
+            }
+        }
         // The same requests from the PC (scripts/ps5lm-app.sh load|unload).
         if (n % 60 == 30 && req.kind == Dashboard::Request::none) {
             if (std::string p = take_request_file("/data/PS5LM/load"); !p.empty()) {
                 req = { Dashboard::Request::load, p };
             } else if (!take_request_file("/data/PS5LM/unload").empty()) {
                 req = { Dashboard::Request::unload, "" };
+            } else if (!take_request_file("/data/PS5LM/probe").empty()) {
+                req = { Dashboard::Request::probe_console, "" };
             } else if (std::string u = take_request_file("/data/PS5LM/fetch"); !u.empty()) {
                 std::thread(probe_fetch, u).detach();
             } else if (!take_request_file("/data/PS5LM/bench-write").empty()) {

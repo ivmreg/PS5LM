@@ -79,7 +79,7 @@ constexpr int          kMarketChipCount = 7;
 
 // ---- Settings -------------------------------------------------------------------
 
-enum class Setting : int { auto_load, default_model, ctx_cap, kv_type, planning_profile, reserve_mib, sounds, tools, introspect, paged_moe, moe_cache_mib, scratch_limit, clear_scratch, download_dir };
+enum class Setting : int { auto_load, default_model, ctx_cap, kv_type, planning_profile, reserve_mib, speculative, draft_model, sounds, tools, introspect, paged_moe, moe_cache_mib, scratch_limit, clear_scratch, download_dir, probe_console };
 
 struct SettingRow {
     Setting      id;
@@ -89,7 +89,7 @@ struct SettingRow {
 
 struct SettingCategory {
     const char * name;
-    SettingRow   rows[4];
+    SettingRow   rows[6];
     int          count;
 };
 
@@ -102,8 +102,10 @@ constexpr SettingCategory kCategories[] = {
       { { Setting::ctx_cap, "Longest context", "The longest that fits, up to this; applies at the next load" },
         { Setting::kv_type, "Context cache", "Auto picks the best that fits; a fixed type trades length for quality" },
         { Setting::planning_profile, "Planning profile", "Plans KV cache/context for the next load; model weights are unchanged" },
-        { Setting::reserve_mib, "Safety threshold", "GPU memory reserved for compute buffers; lower values allow longer contexts" } },
-      4 },
+        { Setting::reserve_mib, "Safety threshold", "GPU memory reserved for compute buffers; lower values allow longer contexts" },
+        { Setting::speculative, "Speculative decoding", "Off, Auto (uses MTP when present), or companion draft model" },
+        { Setting::draft_model, "Draft model", "Companion small model (< 1.6 GB) for draft speculation" } },
+      6 },
     { "Chat",
       { { Setting::tools, "File tools", "The browser chat may read and write files in /data/PS5LM/scratch" },
         { Setting::scratch_limit, "Warn above", "A notification when that folder grows past this" },
@@ -119,8 +121,10 @@ constexpr SettingCategory kCategories[] = {
         { Setting::paged_moe, "Paged MoE (experimental)",
           "Stream Qwen3-MoE experts from SSD when weights exceed RAM; 1-token prefill" },
         { Setting::moe_cache_mib, "Paged MoE cache",
-          "GPU cache reserved for streamed experts when Paged MoE is on" } },
-      3 },
+          "GPU cache reserved for streamed experts when Paged MoE is on" },
+        { Setting::probe_console, "Probe this console",
+          "Measures memory and bandwidth to /data/PS5LM/probe.json (no model loaded)" } },
+      4 },
     { "Diagnostics", {}, 0 },
 };
 constexpr int kCategoryCount = 6;
@@ -411,6 +415,22 @@ std::string setting_text(const Settings & s, Setting id, const std::vector<Model
             return s.reserve_mib == 768 ? "768 MB (Default)"
                  : s.reserve_mib >= 1024 ? format("%.1f GB", s.reserve_mib / 1024.0)
                  : format("%u MB", s.reserve_mib);
+        case Setting::speculative:
+            return s.speculative == "auto" ? "Auto (MTP)"
+                 : s.speculative == "draft" ? "Draft model" : "Off";
+        case Setting::draft_model: {
+            if (s.draft_model.empty()) {
+                return "None";
+            }
+            for (const auto & m : models) {
+                if (m.file == s.draft_model) {
+                    std::string name, build;
+                    split_name(m.label, &name, &build);
+                    return name + "  " + build;
+                }
+            }
+            return "Missing";
+        }
         case Setting::moe_cache_mib: return format("%.1f GB", s.moe_cache_mib / 1024.0);
         case Setting::scratch_limit: return format("%.0f GB", (double) s.scratch_limit_gib);
         case Setting::download_dir: {
@@ -504,6 +524,28 @@ std::vector<Choice> choices_of(const Settings & s, Setting id, const std::vector
                                         : m >= 1024 ? format("%.1f GB", m / 1024.0)
                                         : format("%u MB", m);
                 add(label, notes[i], s.reserve_mib == m, [m](Settings & v) { v.reserve_mib = m; });
+            }
+            break;
+        }
+        case Setting::speculative: {
+            const char * labels[] = { "Off", "Auto (MTP)", "Draft model" };
+            const char * notes[] = { "Standard generation", "Use model's MTP layers when available", "Draft tokens with a companion small model" };
+            const char * modes[] = { "off", "auto", "draft" };
+            for (int i = 0; i < 3; ++i) {
+                const std::string mode = modes[i];
+                add(labels[i], notes[i], s.speculative == mode, [mode](Settings & v) { v.speculative = mode; });
+            }
+            break;
+        }
+        case Setting::draft_model: {
+            add("None", "No draft model", s.draft_model.empty(), [](Settings & v) { v.draft_model.clear(); });
+            for (const auto & m : models) {
+                if (m.fits && m.decision.empty() && m.size_gib <= 1.6) {
+                    std::string name, build;
+                    split_name(m.label, &name, &build);
+                    add(name, build + " (" + gb(m.size_gib) + ")", m.file == s.draft_model,
+                        [f = m.file](Settings & v) { v.draft_model = f; });
+                }
             }
             break;
         }
@@ -1035,6 +1077,9 @@ void Dashboard::update_settings(const hui::InputFrame & input, ui::Feedback & fe
     if (id == Setting::clear_scratch) {
         request_ = { Request::clear_scratch, "" };
         feedback.play(Cue::select);
+    } else if (id == Setting::probe_console) {
+        request_ = { Request::probe_console, "" };
+        feedback.play(Cue::select);
     } else if (is_toggle(id)) {
         bool & on = id == Setting::auto_load  ? settings_.auto_load
                   : id == Setting::sounds     ? settings_.sounds
@@ -1235,11 +1280,14 @@ void Dashboard::draw_hints(gfx::DrawList & l) const {
         h = { { ui::Button::dpad, "Choose" }, { ui::Button::cross, "Open" } };
     } else if (setting_category_ == kDiagnostics) {
         h = { { ui::Button::dpad, "Scroll" }, { ui::Button::square, log_llama_ ? "App log" : "Server log" },
-              { ui::Button::triangle, log_errors_ ? "All lines" : "Errors only" } };
+              { ui::Button::triangle, log_errors_ ? "All lines" : "Errors only" },
+              { ui::Button::cross, "Newest" } };
     } else {
         const Setting id = kCategories[setting_category_].rows[setting_row_].id;
         if (id == Setting::clear_scratch) {
             h = { { ui::Button::circle, "Back" }, { ui::Button::cross, "Clear" } };
+        } else if (id == Setting::probe_console) {
+            h = { { ui::Button::circle, "Back" }, { ui::Button::cross, "Probe" } };
         } else if (is_toggle(id)) {
             h = { { ui::Button::circle, "Back" }, { ui::Button::cross, "Switch" } };
         } else {
@@ -1366,6 +1414,13 @@ void Dashboard::draw_home(gfx::DrawList & l) const {
             }
         } else if (!decision) {
             trace(l, live_.gen_history, { kLeft, 702, 860, 100 }, kInk.with_alpha(0.75f));
+            if (live_.draft_tokens > 0) {
+                const double rate = 100.0 * (double) live_.draft_accepted / (double) live_.draft_tokens;
+                char buf[96];
+                std::snprintf(buf, sizeof(buf), "Draft acceptance: %.0f%% (%llu/%llu)",
+                              rate, (unsigned long long) live_.draft_accepted, (unsigned long long) live_.draft_tokens);
+                put(l, f.regular, buf, kLeft, 818, 20, kInk2);
+            }
         }
 
         // Two quiet meters: what the model holds, and how much of its context is used.
@@ -1874,7 +1929,7 @@ void Dashboard::draw_settings(gfx::DrawList & l) const {
         const float cy = y + kRowH * 0.5f;
         if (is_toggle(r.id)) {
             toggle_switch(l, kRight - 28, cy, toggle_value(settings_, r.id));
-        } else if (r.id != Setting::clear_scratch) {
+        } else if (r.id != Setting::clear_scratch && r.id != Setting::probe_console) {
             const bool focus = in_rows_ && i == setting_row_;
             const Color c = focus ? kInk : kInk2;
             put(l, f.regular, setting_text(settings_, r.id, live_.models, live_.drives), kRight - 68, y + 50, 24, c,
@@ -1882,7 +1937,7 @@ void Dashboard::draw_settings(gfx::DrawList & l) const {
             // A chevron down: X opens a list of the choices.
             l.line(kRight - 44, cy - 4, kRight - 36, cy + 4, 2.4f, c);
             l.line(kRight - 36, cy + 4, kRight - 28, cy - 4, 2.4f, c);
-        } else if (live_.scratch_gib > 0) {
+        } else if (r.id == Setting::clear_scratch && live_.scratch_gib > 0) {
             put(l, f.regular, format("%.1f GB in it", live_.scratch_gib), kRight - 28, y + 50, 22, kInk2,
                  gfx::Align::right);
         }

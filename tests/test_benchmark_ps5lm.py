@@ -393,6 +393,42 @@ class BenchmarkClientTests(unittest.TestCase):
                         )
                 self.assertEqual(raised.exception.code, 2)
 
+    def test_server_reported_draft_metrics_recorded(self):
+        events = [
+            {"choices": [{"delta": {"content": "ok"}}]},
+            {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+            {
+                "choices": [],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 10, "total_tokens": 15},
+                "timings": {
+                    "prompt_n": 5,
+                    "predicted_n": 10,
+                    "draft_n": 10,
+                    "draft_n_accepted": 8,
+                },
+            },
+        ]
+        body = b"".join(_data(event, line_ending="\r\n") for event in events) + b"data: [DONE]\r\n\r\n"
+        with MockEndpoint(
+            lambda payload, index: _response(body=body, fragment_size=4)
+        ) as server:
+            trial = self._trial(server)
+
+        self.assertEqual(trial["status"], "ok")
+        self.assertEqual(trial["server_reported"]["draft_tokens"], 10)
+        self.assertEqual(trial["server_reported"]["draft_accepted"], 8)
+        self.assertEqual(trial["server_reported"]["draft_acceptance_rate"], 0.8)
+
+    def test_prompt_set_selection(self):
+        for pset, expected_id in (("general", "ps5lm-streaming-v1"), ("code", "ps5lm-code-v1"), ("prose", "ps5lm-prose-v1")):
+            schedule = benchmark.build_schedule(repeats=2, include_warmup=True, prompt_set=pset)
+            self.assertEqual(schedule[0][0], "warmup")
+            self.assertEqual(schedule[1][0], "repeat")
+            self.assertEqual(schedule[2][0], "repeat")
+            self.assertEqual(len(schedule), 6)  # 1 warmup + 2 repeats + 3 unrelated
+            config = benchmark.PROMPT_SETS[pset]
+            self.assertEqual(config["id"], expected_id)
+
 
 if __name__ == "__main__":
     unittest.main()

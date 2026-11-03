@@ -86,3 +86,118 @@ and preservation of failed trials:
 ~~~powershell
 python -B tests/test_benchmark_ps5lm.py
 ~~~
+
+## Speculative decoding benchmarks (needs console)
+
+To measure speculative decoding on the console, run comparisons with the draft
+parameters varied across code and prose prompt sets. Server-reported draft
+tokens and accepted tokens are recorded in each trial's `server_reported`:
+
+1. **Qwen 3.5 9B Baseline vs Companion Draft Model (Qwen 3.5 0.8B):**
+   - **Baseline (Speculative Off):** Set `Speculative decoding` to `Off` in Settings.
+     Run benchmark on both code and prose:
+     ```powershell
+     python scripts/benchmark-ps5lm.py --url http://PS5_IP:8081/v1/chat/completions --prompt-set code --warmup --repeats 5 --output build/bench-qwen9b-base-code.json
+     python scripts/benchmark-ps5lm.py --url http://PS5_IP:8081/v1/chat/completions --prompt-set prose --warmup --repeats 5 --output build/bench-qwen9b-base-prose.json
+     ```
+   - **With Companion Draft (`draft_max` 4, 8, 16):** Set `Speculative decoding` to `Draft model`, pick Qwen 3.5 0.8B, and test draft_max values in `/data/PS5LM/settings.json` or CLI.
+     ```powershell
+     python scripts/benchmark-ps5lm.py --url http://PS5_IP:8081/v1/chat/completions --prompt-set code --warmup --repeats 5 --output build/bench-qwen9b-draft8-code.json
+     python scripts/benchmark-ps5lm.py --url http://PS5_IP:8081/v1/chat/completions --prompt-set prose --warmup --repeats 5 --output build/bench-qwen9b-draft8-prose.json
+     ```
+
+2. **Qwen 3.8 27B Baseline vs Multi-Token Prediction (MTP):**
+   - **Baseline (Speculative Off):**
+     ```powershell
+     python scripts/benchmark-ps5lm.py --url http://PS5_IP:8081/v1/chat/completions --prompt-set code --warmup --repeats 5 --output build/bench-qwen27b-base-code.json
+     python scripts/benchmark-ps5lm.py --url http://PS5_IP:8081/v1/chat/completions --prompt-set prose --warmup --repeats 5 --output build/bench-qwen27b-base-prose.json
+     ```
+   - **With MTP (`--spec-type draft-mtp`, `draft_max` 4, 8, 16):** Set `Speculative decoding` to `Auto (MTP)` in Settings.
+     ```powershell
+     python scripts/benchmark-ps5lm.py --url http://PS5_IP:8081/v1/chat/completions --prompt-set code --warmup --repeats 5 --output build/bench-qwen27b-mtp8-code.json
+     python scripts/benchmark-ps5lm.py --url http://PS5_IP:8081/v1/chat/completions --prompt-set prose --warmup --repeats 5 --output build/bench-qwen27b-mtp8-prose.json
+     ```
+
+Record the following table across runs:
+| Model & Mode | Prompt Set | draft_max | Generation tok/s | Acceptance Rate (%) | Peak Free Pool (GiB) |
+|---|---|---|---|---|---|
+| Qwen 3.5 9B (Base) | Code | N/A | | N/A | |
+| Qwen 3.5 9B (Base) | Prose | N/A | | N/A | |
+| Qwen 3.5 9B + 0.8B | Code | 4 / 8 / 16 | | | |
+| Qwen 3.5 9B + 0.8B | Prose | 4 / 8 / 16 | | | |
+| Qwen 3.8 27B (Base) | Code | N/A | | N/A | |
+| Qwen 3.8 27B (Base) | Prose | N/A | | N/A | |
+| Qwen 3.8 27B + MTP | Code | 4 / 8 / 16 | | | |
+| Qwen 3.8 27B + MTP | Prose | 4 / 8 / 16 | | | |
+
+## Integer dot product benchmarks (needs console)
+
+To test the `RADV_PS5_INT_DOT` driver patch (`patches/mesa/0010-radv-ps5-report-integer-dot-product.patch`) on the console:
+
+### 1. Configuration options in `/data/PS5LM/env.txt`
+
+The refined driver patch supports three modes for `RADV_PS5_INT_DOT`:
+- **`RADV_PS5_INT_DOT=auto` (Recommended for Pro)**: Automatically enables integer dot product on PS5 Pro (`CFI-70xx` / Viola), where RDNA 3 hardware contains working `v_dot4_*` instructions. On Base/Slim consoles (`Oberon` GC 10.1.3), it safely remains disabled.
+- **`RADV_PS5_INT_DOT=1` (Force on)**: Forces integer dot product acceleration on any console. On Base/Slim consoles, RADV logs a warning to stderr:
+  ```text
+  radv/ps5: warning: RADV_PS5_INT_DOT=1 forced on non-Pro console (GC 10.1.3 omits v_dot4_* in hardware)
+  ```
+  Note: ggml-vulkan compute shaders (`MESA_SHADER_COMPUTE`) are isolated from NGG workgroup repack (which broke geometry shaders on GC 10.1.3 when dot products were reported), but testing on GC 10.1.3 is experimental.
+- **`RADV_PS5_INT_DOT=0` (or unset)**: Disabled on all models (default behavior).
+- **`RADV_PS5_PRO=1` (Override)**: Simulates PS5 Pro GPU topology (60 active CUs, 2.35 GHz boost, 2.25 GHz memory / 576 GB/s) for testing on host or console.
+
+### 2. Verify device detection and initialization
+
+Add the desired switch to `/data/PS5LM/env.txt` and launch the app.
+Check `/data/PS5LM/llama.log` for driver and ggml-vulkan initialization:
+
+**On PS5 Pro (`RADV_PS5_INT_DOT=auto` or `1`):**
+```text
+radv/ps5: integer dot product enabled (RADV_PS5_INT_DOT=auto)
+ggml_vulkan: 0 = PlayStation 5 Pro GPU (radv) | ... | int dot: 1 | ...
+```
+
+**On Base / Slim (`RADV_PS5_INT_DOT=1` forced):**
+```text
+radv/ps5: warning: RADV_PS5_INT_DOT=1 forced on non-Pro console (GC 10.1.3 omits v_dot4_* in hardware)
+radv/ps5: integer dot product enabled (RADV_PS5_INT_DOT=1)
+ggml_vulkan: 0 = PlayStation 5 GPU (radv) | ... | int dot: 1 | ...
+```
+
+### 3. Correctness verification
+
+Before benchmarking throughput, verify numerical stability and logit fidelity:
+- Compare greedy sampling output (temperature 0, fixed seed) on a 512-token prompt with `RADV_PS5_INT_DOT=0` vs `RADV_PS5_INT_DOT=1` (or `auto` on Pro):
+  ```powershell
+  python scripts/benchmark-ps5lm.py --url http://PS5_IP:8081/v1/chat/completions --max-tokens 512 --repeats 1 --output build/intdot-verify-on.json
+  ```
+- Compare greedy output text and inspect `/v1/introspect` top-k logit rankings; tokens should match or differ only within expected floating-point accumulation variance.
+
+### 4. Performance comparison (Prompt vs Decode tok/s)
+
+Measure prompt processing throughput (2,000-token prompt) and generation tok/s across models with the switch disabled vs enabled:
+- **Qwen 3.5 9B Q4_K_M** (flag off vs on)
+- **Qwen 3.5 9B Q4_0** (flag off vs on: Q4_0 heavily exercises `mul_mat_vec_q4_0_q8_0` integer dot kernels)
+- **Qwen 3.8 27B** (flag off vs on)
+
+Record the results across runs:
+| Console Model | Model & Quant | RADV_PS5_INT_DOT | Prompt tok/s (2k prompt) | Generation tok/s | Status / Anomaly |
+|---|---|---|---|---|---|
+| PS5 Slim (Oberon) | Qwen 3.5 9B Q4_K_M | 0 (default) | *(needs console)* | *(needs console)* | Normal baseline |
+| PS5 Slim (Oberon) | Qwen 3.5 9B Q4_K_M | 1 (forced) | *(needs console)* | *(needs console)* | |
+| PS5 Slim (Oberon) | Qwen 3.5 9B Q4_0 | 0 (default) | *(needs console)* | *(needs console)* | Normal baseline |
+| PS5 Slim (Oberon) | Qwen 3.5 9B Q4_0 | 1 (forced) | *(needs console)* | *(needs console)* | |
+| PS5 Slim (Oberon) | Qwen 3.8 27B | 0 (default) | *(needs console)* | *(needs console)* | Normal baseline |
+| PS5 Slim (Oberon) | Qwen 3.8 27B | 1 (forced) | *(needs console)* | *(needs console)* | |
+| PS5 Pro (Viola) | Qwen 3.5 9B Q4_K_M | auto | *(needs PS5 Pro)* | *(needs PS5 Pro)* | |
+| PS5 Pro (Viola) | Qwen 3.5 9B Q4_0 | auto | *(needs PS5 Pro)* | *(needs PS5 Pro)* | |
+| PS5 Pro (Viola) | Qwen 3.8 27B | auto | *(needs PS5 Pro)* | *(needs PS5 Pro)* | |
+
+### 5. Failure modes to watch
+
+- `VK_ERROR_DEVICE_LOST` during shader compilation or execution.
+- Console freeze or GPU hang (if encountered, power cycle the console and leave the flag off).
+- Output text corruption or NaN/divergent logits.
+If any failure mode occurs, keep `RADV_PS5_INT_DOT` off and capture `/data/PS5LM/llama.log`.
+
+

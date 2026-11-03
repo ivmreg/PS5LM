@@ -255,6 +255,10 @@ void StatsCollector::set_model(const Live & m) {
     live_.model_file  = m.model_file;
     live_.plan        = m.plan;
     live_.args        = m.args;
+    live_.spec_mode   = m.spec_mode;
+    live_.draft_tokens = 0;
+    live_.draft_accepted = 0;
+    live_.draft_acceptance_rate = 0.0f;
 }
 
 void StatsCollector::set_phase(std::string phase) {
@@ -467,6 +471,13 @@ void StatsCollector::run() {
             }
             live_.tokens        = (uint64_t) tokens;
             live_.prompt_tokens = (uint64_t) metric(m, "prompt_tokens_total");
+            const double dtok = metric(m, "spec_decode_num_draft_tokens_total");
+            const double dacc = metric(m, "spec_decode_num_accepted_tokens_total");
+            live_.draft_tokens   = (uint64_t) dtok;
+            live_.draft_accepted = (uint64_t) dacc;
+            if (dtok > 0) {
+                live_.draft_acceptance_rate = (float) (dacc / dtok);
+            }
             if (last_working && !working && tokens > last_tokens) {
                 live_.requests++;  // a reply finished
             }

@@ -35,6 +35,11 @@ struct ModelInfo {
     uint32_t    n_ctx_train     = 0;
     uint32_t    n_expert        = 0;   // 0: dense
     uint32_t    n_expert_used   = 0;
+    uint32_t    n_mtp_layers    = 0;   // <arch>.nextn_predict_layers (e.g. Qwen 3.8 MTP / NextN)
+    uint64_t    mtp_bytes       = 0;   // tensor bytes if parsed, else estimate
+    std::string mtp_sidecar;           // MTP sidecar file beside the model, or empty
+    std::string tokenizer_model;       // tokenizer.ggml.model (e.g. "llama", "gpt2", "qwen2")
+    uint32_t    vocab_size      = 0;   // vocab token count
     uint64_t    expert_bytes    = 0;   // total byte size of routed expert weight tensors (when tensor directory is parsed)
     uint64_t    non_expert_bytes = 0;  // file_bytes minus expert_bytes (or non-expert tensor bytes + header overhead)
     uint64_t    moe_cache_min_bytes = 0; // minimum MoE cache + group staging + slot maps for 1-token paged execution
@@ -59,6 +64,9 @@ ModelInfo read_model_header(const std::string & name, const std::string & head, 
 // The vision projector ("mmproj") beside a model, or empty.
 std::string find_mmproj(const std::string & model_path);
 
+// The MTP head sidecar ("mtp") beside a model, or empty.
+std::string find_mtp(const std::string & model_path);
+
 ModelInfo read_model_info(const std::string & path);
 
 // Bytes of KV cache per token of context, for a cache type ("f16", "q8_0", "q4_0").
@@ -75,11 +83,21 @@ struct Preset {
 const std::vector<Preset> & presets();
 const Preset * find_preset(const ModelInfo & m);
 
+struct SpecOptions {
+    std::string mode = "off";        // "off", "mtp", "draft"
+    std::string draft_path;          // for "draft" or sidecar for "mtp"
+    uint64_t    draft_bytes = 0;
+    uint32_t    draft_max = 8;       // tokens drafted per step
+    uint32_t    draft_min = 1;
+};
+
 struct Plan {
     bool        fits = false;
     bool        paged_moe = false;
     uint32_t    moe_cache_mib = 0;
     double      moe_cache_gib = 0;
+    std::string spec_mode = "off";   // "off", "mtp", "draft"
+    double      spec_gib = 0;        // extra memory budget allocated for speculative decoding
     uint32_t    ctx  = 0;
     std::string kv_type;      // cache type for K and V
     double      weights_gib  = 0;
@@ -100,7 +118,8 @@ struct Plan {
 Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap = 65536,
                 const char * kv_force = nullptr, const char * planning_profile = "long_context",
                 bool allow_paged_moe = false, uint32_t moe_cache_mib = 2048,
-                uint32_t reserve_mib = 768);
+                uint32_t reserve_mib = 768,
+                const SpecOptions * spec = nullptr);
 
 // Every .gguf in the given folders (not recursive), sorted by name. Split
 // files are listed by their first part only.

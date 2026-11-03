@@ -34,12 +34,18 @@ int main() {
     assert(defaults.paged_moe == false);
     assert(defaults.moe_cache_mib == 2048);
     assert(defaults.reserve_mib == 768);
+    assert(defaults.speculative == "off");
+    assert(defaults.draft_model.empty());
+    assert(defaults.draft_max == 8);
     write_text(path, "{}\n");
     const ps5lm::Settings empty_loaded = ps5lm::load_settings(path.c_str());
     assert(empty_loaded.planning_profile == "long_context");
     assert(empty_loaded.paged_moe == false);
     assert(empty_loaded.moe_cache_mib == 2048);
     assert(empty_loaded.reserve_mib == 768);
+    assert(empty_loaded.speculative == "off");
+    assert(empty_loaded.draft_model.empty());
+    assert(empty_loaded.draft_max == 8);
 
     for (const char * name : { "long_context", "balanced", "kv_precision" }) {
         ps5lm::Settings expected;
@@ -49,12 +55,18 @@ int main() {
         expected.paged_moe = true;
         expected.moe_cache_mib = 4096;
         expected.reserve_mib = 384;
+        expected.speculative = "auto";
+        expected.draft_model = "/data/PS5LM/models/draft.gguf";
+        expected.draft_max = 12;
         assert(ps5lm::save_settings(path.c_str(), expected));
         const ps5lm::Settings loaded = ps5lm::load_settings(path.c_str());
         assert(loaded == expected);
         assert(loaded.paged_moe == true);
         assert(loaded.moe_cache_mib == 4096);
         assert(loaded.reserve_mib == 384);
+        assert(loaded.speculative == "auto");
+        assert(loaded.draft_model == "/data/PS5LM/models/draft.gguf");
+        assert(loaded.draft_max == 12);
     }
 
     write_text(path, "{\"planning_profile\":\"future-policy\"}\n");
@@ -109,6 +121,24 @@ int main() {
     assert(ps5lm::load_settings(path.c_str()).reserve_mib == 128);
     write_text(path, "{\"reserve_mib\":4096}\n");
     assert(ps5lm::load_settings(path.c_str()).reserve_mib == 4096);
+
+    // Malformed and invalid speculative tests
+    write_text(path, "{\"speculative\":\"invalid-mode\"}\n");
+    assert(ps5lm::load_settings(path.c_str()).speculative == "off");
+    write_text(path, "{\"speculative\":123}\n");
+    assert(ps5lm::load_settings(path.c_str()).speculative == "off");
+    write_text(path, "{\"speculative\":null}\n");
+    assert(ps5lm::load_settings(path.c_str()).speculative == "off");
+
+    // Malformed and out-of-bounds draft_max tests
+    write_text(path, "{\"draft_max\":0}\n");
+    assert(ps5lm::load_settings(path.c_str()).draft_max == 8);
+    write_text(path, "{\"draft_max\":128}\n");
+    assert(ps5lm::load_settings(path.c_str()).draft_max == 8);
+    write_text(path, "{\"draft_max\":\"16\"}\n");
+    assert(ps5lm::load_settings(path.c_str()).draft_max == 8);
+    write_text(path, "{\"draft_max\":16}\n");
+    assert(ps5lm::load_settings(path.c_str()).draft_max == 16);
 
     std::remove(path.c_str());
     std::puts("settings_test: ok (defaults, validation and profile round trips)");

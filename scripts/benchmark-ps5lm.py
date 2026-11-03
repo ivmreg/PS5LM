@@ -48,6 +48,65 @@ UNRELATED_PROMPTS = (
     ),
 )
 
+PROMPT_SETS = {
+    "general": {
+        "id": "ps5lm-streaming-v1",
+        "repeat": REPEAT_PROMPT,
+        "warmup": WARMUP_PROMPT,
+        "unrelated": UNRELATED_PROMPTS,
+    },
+    "code": {
+        "id": "ps5lm-code-v1",
+        "repeat": (
+            "Write a Python function `quicksort(arr)` that sorts a list of integers in ascending "
+            "order. Include a concise docstring and comments explaining the partition step and base case."
+        ),
+        "warmup": "def ready(): return True",
+        "unrelated": (
+            (
+                "binary-search",
+                "Write a Python function `binary_search(arr, target)` that returns the index of target "
+                "in a sorted list or -1 if not found. Include docstring and comments.",
+            ),
+            (
+                "lru-cache",
+                "Write a minimal Python class `LRUCache(capacity)` with `get(key)` and `put(key, value)` "
+                "methods using standard library collections. Include comments.",
+            ),
+            (
+                "merge-sorted",
+                "Write a Python function `merge_sorted(a, b)` that merges two sorted lists into one sorted list "
+                "in linear time. Include docstring.",
+            ),
+        ),
+    },
+    "prose": {
+        "id": "ps5lm-prose-v1",
+        "repeat": (
+            "In about 120 words, describe the atmosphere of a quiet coastal library in late autumn as rain "
+            "taps against the tall windows. Use vivid sensory details and avoid bullets."
+        ),
+        "warmup": "Ready.",
+        "unrelated": (
+            (
+                "mountain-dawn",
+                "In about 100 words, portray the sunrise over a snowy mountain range, highlighting changes in "
+                "light, shadows, and crisp morning air. Avoid bullets.",
+            ),
+            (
+                "desert-night",
+                "In about 100 words, depict the stillness of a desert at midnight under a clear sky filled with "
+                "stars. Avoid bullets.",
+            ),
+            (
+                "harbor-dusk",
+                "In about 100 words, describe the scents and sounds of an old fishing harbor at twilight as the "
+                "boats return to their docks. Avoid bullets.",
+            ),
+        ),
+    },
+}
+
 BASE_REQUEST_PARAMETERS = {
     "stream": True,
     "stream_options": {"include_usage": True},
@@ -292,6 +351,15 @@ def _apply_sse_event(event_name, data, trial, started):
         if trial["server_reported"]["timings"] is None:
             trial["server_reported"]["timings"] = []
         trial["server_reported"]["timings"].append(timings)
+        if isinstance(timings, dict):
+            draft_n = timings.get("draft_n")
+            draft_acc = timings.get("draft_n_accepted")
+            if draft_n is not None:
+                trial["server_reported"]["draft_tokens"] = draft_n
+            if draft_acc is not None:
+                trial["server_reported"]["draft_accepted"] = draft_acc
+            if draft_n is not None and draft_acc is not None and draft_n > 0:
+                trial["server_reported"]["draft_acceptance_rate"] = round(draft_acc / draft_n, 4)
 
     choices = payload.get("choices", [])
     if choices is None:
@@ -356,7 +424,13 @@ def _base_trial(index, kind, prompt_id, prompt, requested_model):
             "request_id": None,
             "server_timing_header": None,
         },
-        "server_reported": {"usage": None, "timings": None},
+        "server_reported": {
+            "usage": None,
+            "timings": None,
+            "draft_tokens": None,
+            "draft_accepted": None,
+            "draft_acceptance_rate": None,
+        },
         "completion_chunk_count": 0,
         "done_received": False,
         "error": None,
@@ -524,23 +598,25 @@ def run_trial(url, prompt, prompt_id, kind, index, requested_model, timeout_seco
     return trial
 
 
-def build_schedule(repeats, include_warmup):
+def build_schedule(repeats, include_warmup, prompt_set="general"):
+    config = PROMPT_SETS.get(prompt_set, PROMPT_SETS["general"])
     schedule = []
     if include_warmup:
-        schedule.append(("warmup", "warmup", WARMUP_PROMPT))
+        schedule.append(("warmup", "warmup", config["warmup"]))
     for _ in range(repeats):
-        schedule.append(("repeat", "repeat", REPEAT_PROMPT))
-    for prompt_id, prompt in UNRELATED_PROMPTS:
+        schedule.append(("repeat", "repeat", config["repeat"]))
+    for prompt_id, prompt in config["unrelated"]:
         schedule.append(("unrelated", prompt_id, prompt))
     return schedule
 
 
 def run_benchmark(url, requested_model="default", repeats=3, include_warmup=False,
                   timeout_seconds=60.0, api_key=None, api_key_env=None,
-                  max_tokens=256):
+                  max_tokens=256, prompt_set="general"):
     run_started = _utc_now()
     trials = []
-    for index, (kind, prompt_id, prompt) in enumerate(build_schedule(repeats, include_warmup), 1):
+    config = PROMPT_SETS.get(prompt_set, PROMPT_SETS["general"])
+    for index, (kind, prompt_id, prompt) in enumerate(build_schedule(repeats, include_warmup, prompt_set), 1):
         trials.append(
             run_trial(
                 url=url,
@@ -582,8 +658,9 @@ def run_benchmark(url, requested_model="default", repeats=3, include_warmup=Fals
             "max_tokens": max_tokens,
             "repeat_count": repeats,
             "warmup_included": include_warmup,
-            "prompt_set": PROMPT_SET,
-            "unrelated_prompt_ids": [prompt_id for prompt_id, _ in UNRELATED_PROMPTS],
+            "prompt_set": config["id"],
+            "prompt_category": prompt_set,
+            "unrelated_prompt_ids": [prompt_id for prompt_id, _ in config["unrelated"]],
             "request_parameters": request_parameters(max_tokens),
             "api_key_environment_variable_used": bool(api_key),
             "api_key_environment_variable": api_key_env,
@@ -644,6 +721,12 @@ def make_parser():
     parser.add_argument("--warmup", action="store_true", help="run one separate warmup trial before measured trials")
     parser.add_argument("--timeout", type=_positive_float, default=60.0, help="overall timeout per trial in seconds")
     parser.add_argument(
+        "--prompt-set",
+        choices=["general", "code", "prose"],
+        default="general",
+        help="prompt category to benchmark (default: general)",
+    )
+    parser.add_argument(
         "--output",
         default=os.path.join("build", "benchmark-results.json"),
         help="raw JSON result path (default: build/benchmark-results.json)",
@@ -675,6 +758,7 @@ def main(argv=None):
         api_key=api_key,
         api_key_env=args.api_key_env,
         max_tokens=args.max_tokens,
+        prompt_set=args.prompt_set,
     )
     try:
         _write_json(args.output, report)

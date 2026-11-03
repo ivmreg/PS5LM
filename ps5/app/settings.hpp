@@ -22,6 +22,9 @@ struct Settings {
     bool        introspect = false;  // POST /v1/introspect: raw logits and activations (off by default)
     bool        paged_moe = false;   // opt-in SSD expert paging for beyond-RAM Qwen3-MoE models
     uint32_t    moe_cache_mib = 2048; // GPU expert slot cache budget in MiB when paged_moe is enabled
+    std::string speculative = "off"; // "off", "auto", "draft"
+    std::string draft_model;         // companion draft model file path
+    uint32_t    draft_max = 8;       // tokens drafted per step
     uint32_t    scratch_limit_gib = 2;  // warn when the scratch folder grows past this
     std::string download_dir = "/data/PS5LM/models";  // where the market saves models
 

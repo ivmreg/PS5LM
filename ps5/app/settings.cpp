@@ -49,6 +49,21 @@ Settings load_settings(const char * path) {
             s.moe_cache_mib = (uint32_t) val;
         }
     }
+    const auto spec = j.find("speculative");
+    if (spec != j.end() && spec->is_string()) {
+        const std::string val = spec->get<std::string>();
+        if (val == "off" || val == "auto" || val == "draft") {
+            s.speculative = val;
+        }
+    }
+    s.draft_model = j.value("draft_model", s.draft_model);
+    const auto dmax = j.find("draft_max");
+    if (dmax != j.end() && dmax->is_number_unsigned()) {
+        const uint64_t val = dmax->get<uint64_t>();
+        if (val >= 1 && val <= 64) {
+            s.draft_max = (uint32_t) val;
+        }
+    }
     s.scratch_limit_gib = j.value("scratch_limit_gib", s.scratch_limit_gib);
     s.download_dir  = j.value("download_dir", s.download_dir);
     return s;
@@ -62,6 +77,7 @@ bool save_settings(const char * path, const Settings & s) {
         { "sounds", s.sounds },       { "tools", s.tools },
         { "introspect", s.introspect },
         { "paged_moe", s.paged_moe }, { "moe_cache_mib", s.moe_cache_mib },
+        { "speculative", s.speculative }, { "draft_model", s.draft_model }, { "draft_max", s.draft_max },
         { "scratch_limit_gib", s.scratch_limit_gib }, { "download_dir", s.download_dir },
     };
     std::ofstream out(path);

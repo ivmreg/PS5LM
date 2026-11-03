@@ -1,0 +1,151 @@
+From b8a14e45dd6a5ee5bcf9b4aec8ca3952e4d88008 Mon Sep 17 00:00:00 2001
+From: ps5cemu <ps5cemu@localhost>
+Date: Tue, 3 Nov 2026 17:12:22 +0000
+Subject: [PATCH] radv/ps5: optionally report integer dot product acceleration
+ and detect PS5 Pro
+
+Detect PS5 Pro (CFI-70xx / Viola) via sceKernelGetHwModelName and optional
+RADV_PS5_PRO override, updating active CU count to 60, clocks (2.35 GHz engine,
+2.25 GHz memory), and device marketing name.
+
+Support RADV_PS5_INT_DOT (auto/1/0):
+- auto: enabled on PS5 Pro, disabled on Base/Slim (Oberon GC 10.1.3).
+- 1 or true: enabled; warns if forced on non-Pro console where GC 10.1.3
+  omits hardware v_dot4_*. Compute shaders (ggml-vulkan MMQ) do not pass
+  through NGG workgroup repack.
+- 0, false, or unset: disabled (default).
+---
+ src/amd/vulkan/winsys/ps5/radv_ps5_platform.c | 20 ++++++++
+ src/amd/vulkan/winsys/ps5/radv_ps5_platform.h |  3 ++
+ src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c   | 47 ++++++++++++++++++-
+ 3 files changed, 69 insertions(+), 1 deletion(-)
+
+diff --git a/src/amd/vulkan/winsys/ps5/radv_ps5_platform.c b/src/amd/vulkan/winsys/ps5/radv_ps5_platform.c
+index 67b304f..f5e7a98 100644
+--- a/src/amd/vulkan/winsys/ps5/radv_ps5_platform.c
++++ b/src/amd/vulkan/winsys/ps5/radv_ps5_platform.c
+@@ -19,11 +19,13 @@
+ #include "util/os_time.h"
+ #include "util/simple_mtx.h"
+ #include "util/u_atomic.h"
++#include "util/u_debug.h"
+ #include "util/u_math.h"
+ 
+ #if defined(__PROSPERO__)
+ #include <ps5platform/agc.h>
+ #include <ps5platform/kernel.h>
++__attribute__((weak)) int sceKernelGetHwModelName(char *name);
+ #else
+ #include <sys/mman.h>
+ #endif
+@@ -1034,3 +1036,21 @@ radv_ps5_platform_init(void)
+    call_once(&radv_ps5_once, radv_ps5_platform_once);
+    return radv_ps5_ready;
+ }
++
++bool
++radv_ps5_is_pro(void)
++{
++   const char *env = debug_get_option("RADV_PS5_PRO", NULL);
++   if (env)
++      return debug_parse_bool_option(env, false);
++
++#if defined(__PROSPERO__)
++   if (sceKernelGetHwModelName) {
++      char model[32] = {0};
++      if (sceKernelGetHwModelName(model) == 0 && strncmp(model, "CFI-7", 5) == 0)
++         return true;
++   }
++#endif
++
++   return false;
++}
+diff --git a/src/amd/vulkan/winsys/ps5/radv_ps5_platform.h b/src/amd/vulkan/winsys/ps5/radv_ps5_platform.h
+index f203fad..25a49b7 100644
+--- a/src/amd/vulkan/winsys/ps5/radv_ps5_platform.h
++++ b/src/amd/vulkan/winsys/ps5/radv_ps5_platform.h
+@@ -125,4 +125,7 @@ int radv_ps5_set_hs_offchip_param(uint32_t granularity, uint32_t buffering);
+ uint64_t radv_ps5_now_ns(void);
+ void radv_ps5_sleep_us(unsigned microseconds);
+ 
++/* Whether the console is a PS5 Pro (CFI-70xx / Viola) or simulated as one. */
++bool radv_ps5_is_pro(void);
++
+ #endif /* RADV_PS5_PLATFORM_H */
+diff --git a/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c b/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c
+index 27f613f..1fe58ac 100644
+--- a/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c
++++ b/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c
+@@ -10,6 +10,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <strings.h>
+ 
+ #include "addrlib/inc/addrtypes.h"
+ #include "addrlib/src/amdgpu_asic_addr.h"
+@@ -220,6 +221,21 @@ radv_ps5_fill_info(struct radeon_info *info, bool compiler_compat_mode, uint32_t
+       .gs_prim_buffer_depth = 1792,
+       .max_gs_waves_per_vgt = 32,
+    };
++   if (radv_ps5_is_pro()) {
++      dev.cu_active_number = 60;
++      dev.num_cu_per_sh = 16;
++      dev.cu_ao_mask = 0x7fff;
++      dev.cu_bitmap[0][0] = 0x7fff;
++      dev.cu_bitmap[0][1] = 0x7fff;
++      dev.cu_bitmap[1][0] = 0x7fff;
++      dev.cu_bitmap[1][1] = 0x7fff;
++      dev.cu_ao_bitmap[0][0] = 0x7fff;
++      dev.cu_ao_bitmap[0][1] = 0x7fff;
++      dev.cu_ao_bitmap[1][0] = 0x7fff;
++      dev.cu_ao_bitmap[1][1] = 0x7fff;
++      dev.max_engine_clock = UINT64_C(2350000);
++      dev.max_memory_clock = UINT64_C(2250000);
++   }
+    const uint64_t pool = radv_ps5_memory_pool_bytes();
+    const struct drm_amdgpu_memory_info memory = {
+       .vram = {.total_heap_size = pool},
+@@ -322,9 +338,38 @@ static void
+ radv_ps5_describe_gpu(struct radeon_info *info, bool compiler_compat_mode)
+ {
+    radv_ps5_fill_info(info, compiler_compat_mode, 3, 0xa0300, RADV_PS5_EXTERNAL_REV);
+-   snprintf(info->marketing_name, sizeof(info->marketing_name), "PlayStation 5 GPU");
++   if (radv_ps5_is_pro())
++      snprintf(info->marketing_name, sizeof(info->marketing_name), "PlayStation 5 Pro GPU");
++   else
++      snprintf(info->marketing_name, sizeof(info->marketing_name), "PlayStation 5 GPU");
+    radv_ps5_take_gc_10_1_3_traits(info, compiler_compat_mode);
+ 
++   /* Base/Slim PS5 (Oberon GC 10.1.3 / CHIP_GFX1013) omits functional v_dot4_*
++    * hardware dot product instructions in its RDNA 1-derived core (returning 0).
++    * PS5 Pro (Viola / CFI-70xx) upgrades to RDNA 3/3.5 compute units with functional
++    * hardware integer dot product instructions.
++    * With RADV_PS5_INT_DOT=auto, acceleration is enabled on PS5 Pro only.
++    * Forcing RADV_PS5_INT_DOT=1 on non-Pro logs a warning. */
++   const char *int_dot_opt = debug_get_option("RADV_PS5_INT_DOT", NULL);
++   bool int_dot = false;
++   if (int_dot_opt) {
++      if (strcmp(int_dot_opt, "auto") == 0) {
++         int_dot = radv_ps5_is_pro();
++      } else if (strcmp(int_dot_opt, "1") == 0 || strcasecmp(int_dot_opt, "true") == 0) {
++         int_dot = true;
++         if (!radv_ps5_is_pro()) {
++            fprintf(stderr,
++                    "radv/ps5: warning: RADV_PS5_INT_DOT=1 forced on non-Pro console (GC 10.1.3 omits v_dot4_* in hardware)\n");
++         }
++      } else if (strcmp(int_dot_opt, "0") == 0 || strcasecmp(int_dot_opt, "false") == 0) {
++         int_dot = false;
++      }
++   }
++   if (int_dot) {
++      info->compiler_info.has_accelerated_dot_product = true;
++      fprintf(stderr, "radv/ps5: integer dot product enabled (RADV_PS5_INT_DOT=%s)\n", int_dot_opt);
++   }
++
+    /* This GPU's parameter cache rotates per-vertex fragment inputs and tells the shader nothing about it: the compiler
+     * restores the order itself (docs/BARYCENTRIC_GFX101.md), so VK_KHR_fragment_shader_barycentric is reported. */
+    info->compiler_info.emulate_ps_strict_vertex_order = true;
+-- 
+2.43.0
+

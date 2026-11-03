@@ -179,6 +179,8 @@ rm -f "$obj/libps5lm_kit.a"
 for src in display dashboard stats; do
     cxx -fexceptions -fcxx-exceptions "${kitflags[@]}" -c "$root/ps5/app/$src.cpp" -o "$obj/$src.o"
 done
+cxx -std=c++20 -fexceptions -fcxx-exceptions -I "$headers/include" -I "$llama/vendor" -I "$llama/ggml/include" "${kitflags[@]}" \
+    -c "$root/ps5/app/probe.cpp" -o "$obj/probe.o"
 
 # AGC comes from system modules; these stubs only name the imports, every
 # one either driver (the GL object, RADV) makes.
@@ -210,7 +212,7 @@ mapfile -t libs < <(find "$out/llama" -name '*.a' | sort)
 "$sdk/bin/prospero-lld" "${radv_linker_script[@]}" --eh-frame-hdr "${radv_link_flags[@]}" \
     --version-script "$vk/tooling/native/app-symbols.map" --exclude-libs=ALL \
     -e _start -o "$out/llvm-pie.elf" \
-    "$obj/app_crt.o" "$obj/app_cpp_runtime.o" "$obj/main.o" "$obj/storage_probe.o" "$obj/display.o" "$obj/model_plan.o" "$obj/settings.o" "$obj/fetch.o" "$obj/market.o" "$obj/ftp_writer.o" "$obj/activity.o" "$obj/sha256.o" "$obj/dashboard.o" "$obj/stats.o" \
+    "$obj/app_crt.o" "$obj/app_cpp_runtime.o" "$obj/main.o" "$obj/storage_probe.o" "$obj/display.o" "$obj/model_plan.o" "$obj/settings.o" "$obj/fetch.o" "$obj/market.o" "$obj/ftp_writer.o" "$obj/activity.o" "$obj/sha256.o" "$obj/dashboard.o" "$obj/stats.o" "$obj/probe.o" \
     --start-group "${libs[@]}" "$obj/libps5lm_kit.a" "$obj/libps5app_compat.a" "$out/gl/libps5lm_gl.a" --end-group \
     "$out/stubs/libSceAgc.so" "$out/stubs/libSceAgcDriver.so" \
     "${radv_link_inputs[@]}" \

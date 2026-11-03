@@ -136,3 +136,35 @@ Unloading a model in the running app leaves part of its GPU memory held: with Qw
 ps5-homebrew-ui draws through ps5-opengl in the same title as RADV: the GL stack is linked as one object with only its GL/EGL API global (4,399 symbol names collide with RADV's Mesa otherwise), `sceAgcInit` runs once for both drivers (`--wrap`), and the GL runtime's thread-local initialiser `_ZTH23_mesa_glapi_tls_Context` is an empty function, as ProsperoAI has it. The screen costs about 0.35 GiB of the pool (11.38 to 11.03 GiB free). The app can be driven from a PC without a controller: `scripts/ps5lm-app.sh close|deploy|launch|screenshot|load|unload`.
 
 ShadowMountPlus registers a title once and copies its icon and backgrounds then; replacing them later needs a re-registration. Uninstalling to force one hit "Register failed: TitleDir bridge unavailable" after ShadowMountPlus had logged `stale cave bridge detached`; reloading ShadowMountPlus fixed it.
+
+## PS5 Pro
+
+Hardware specifications and console probe behavior for the PlayStation 5 Pro (`Viola` / `Trinity` / `CFI-70xx`).
+
+### Confirmed hardware specifications
+
+- **Model identification**: `CFI-70xx` returned by `sceKernelGetHwModelName()`.
+- **Compute core**: 60 active Compute Units (64 physical) running at up to 2.35 GHz boost clock (versus 36 CUs at 2.23 GHz on Base/Slim). Dual-issue FP32 math yields up to ~33.5 TFLOPS theoretical compute.
+- **Unified memory**: 16 GB 256-bit GDDR6 operating at 18 Gbps, providing **576 GB/s raw bandwidth** (+28.6% over the 448 GB/s on Base/Slim). This directly increases autoregressive token generation speed, which is strictly memory-bandwidth bound.
+- **Dedicated OS RAM**: 2 GB DDR5 for system services, offloading system tasks from the unified GDDR6 pool (Base/Slim uses 512 MB DDR4 alongside unified RAM).
+- **Title direct memory budget**: **~13.7 GB** direct memory allocated to titles (compared to ~12.5 GB on Base/Slim), yielding **+1.2 GB of extra direct memory headroom** for larger model weights and expanded KV caches.
+- **CPU**: 8-core / 16-thread AMD Zen 2 with a high-frequency boost mode up to 3.85 GHz (+10% over standard 3.5 GHz).
+- **Dedicated ML accelerator**: Custom PlayStation Spectral Super Resolution (PSSR) hardware providing 300 TOPS INT8 and 67 TFLOPS FP16 (detailed in `docs/PRO_ML_NOTES.md`).
+
+### Live console probing (`/data/PS5LM/probe.json`)
+
+The Diagnostics action **"Probe this console"** runs when no model is active, allocating direct memory chunks to determine exact pool ceilings, querying Vulkan properties and hardware integer dot product acceleration, and executing GPU/CPU bandwidth microbenchmarks before releasing resources.
+
+| Measurement / Field | PS5 Slim (CFI-2015, Measured) | PS5 Pro (CFI-70xx, Projected / Console Run) |
+|---|---|---|
+| Console Model (`sceKernelGetHwModelName`) | `CFI-2015` | `CFI-70xx` *(needs PS5 Pro console run)* |
+| Direct Memory Pool (`sceKernelGetDirectMemorySize`) | 12.0 GiB (12,884,901,888 B) | ~13.7 GB *(needs PS5 Pro console run)* |
+| Largest Single Direct Allocation | 11.25 GiB (12,079,595,520 B) | *(needs PS5 Pro console run)* |
+| Vulkan Device Name | `PlayStation 5 GPU` | `PlayStation 5 Pro GPU` *(needs PS5 Pro console run)* |
+| Vulkan Device Local Heap | 11.44 GiB (12,284,067,840 B) | ~12.6–12.8 GiB *(needs PS5 Pro console run)* |
+| Active Compute Units (reported) | 36 CUs | 60 CUs *(needs PS5 Pro console run)* |
+| Integer Dot Product (`VkPhysicalDeviceShaderIntegerDotProductProperties`) | False (0) / True (1 forced) | True (auto-enabled on Pro) *(needs PS5 Pro console run)* |
+| GPU Copy Bandwidth (1 GiB buffer copy) | *(needs console run)* | *(needs PS5 Pro console run)* |
+| CPU Copy Bandwidth (AVX2 memcpy) | *(needs console run)* | *(needs PS5 Pro console run)* |
+| Qwen 3.8 27B UD-IQ2_XXS Decode tok/s | 9 to 21 tok/s | *(needs PS5 Pro console run)* |
+

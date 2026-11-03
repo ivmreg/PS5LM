@@ -37,6 +37,14 @@ c++ -std=c++20 -Ithird_party/llama.cpp/vendor \
     -o "$host_build/settings_test"
 "$host_build/settings_test"
 
+echo "== console probe (C++20) =="
+c++ -std=c++20 -O1 -pthread \
+    -Ithird_party/llama.cpp/vendor \
+    -Ips5/app \
+    ps5/app/probe_test.cpp ps5/app/probe.cpp ps5/app/stats.cpp \
+    -o "$host_build/probe_test"
+"$host_build/probe_test"
+
 echo "== dashboard host syntax (C++20) =="
 c++ -std=c++20 -fsyntax-only \
     -Ithird_party/ps5-homebrew-ui/src \

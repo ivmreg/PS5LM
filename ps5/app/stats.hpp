@@ -114,6 +114,10 @@ struct Live {
     double   uptime_s  = 0;
     uint64_t tokens    = 0;  // generated since start
     uint64_t prompt_tokens = 0;
+    uint64_t draft_tokens = 0;
+    uint64_t draft_accepted = 0;
+    float    draft_acceptance_rate = 0;
+    std::string spec_mode = "off";
     uint64_t requests  = 0;
     uint32_t ctx_used  = 0;  // in the running slot
 

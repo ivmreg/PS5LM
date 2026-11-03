@@ -528,7 +528,8 @@ int main(int argc, char ** argv) {
     assert(mtp_plan.spec_gib > 0.0);
     assert(std::find(mtp_plan.args.begin(), mtp_plan.args.end(), "--spec-type") != mtp_plan.args.end());
     assert(std::find(mtp_plan.args.begin(), mtp_plan.args.end(), "draft-mtp") != mtp_plan.args.end());
-    assert(std::find(mtp_plan.args.begin(), mtp_plan.args.end(), "--draft-max") != mtp_plan.args.end());
+    assert(std::find(mtp_plan.args.begin(), mtp_plan.args.end(), "--spec-draft-n-max") != mtp_plan.args.end());
+    assert(std::find(mtp_plan.args.begin(), mtp_plan.args.end(), "--spec-draft-n-min") != mtp_plan.args.end());
     assert(has_args(mtp_plan, "-ctkd", mtp_plan.kv_type.c_str()));
     assert(has_args(mtp_plan, "-ctvd", mtp_plan.kv_type.c_str()));
 
@@ -571,10 +572,14 @@ int main(int argc, char ** argv) {
     assert(draft_plan.fits);
     assert(draft_plan.spec_mode == "draft");
     assert(draft_plan.spec_gib > 0.6);
+    assert(std::find(draft_plan.args.begin(), draft_plan.args.end(), "--spec-type") != draft_plan.args.end());
+    assert(std::find(draft_plan.args.begin(), draft_plan.args.end(), "draft-simple") != draft_plan.args.end());
     assert(std::find(draft_plan.args.begin(), draft_plan.args.end(), "-md") != draft_plan.args.end());
     assert(std::find(draft_plan.args.begin(), draft_plan.args.end(), "/data/PS5LM/models/draft-0.8b.gguf") != draft_plan.args.end());
     assert(std::find(draft_plan.args.begin(), draft_plan.args.end(), "--spec-draft-ngl") != draft_plan.args.end());
     assert(std::find(draft_plan.args.begin(), draft_plan.args.end(), "999") != draft_plan.args.end());
+    assert(std::find(draft_plan.args.begin(), draft_plan.args.end(), "--spec-draft-n-max") != draft_plan.args.end());
+    assert(std::find(draft_plan.args.begin(), draft_plan.args.end(), "--spec-draft-n-min") != draft_plan.args.end());
     assert(has_args(draft_plan, "-ctkd", draft_plan.kv_type.c_str()));
     assert(has_args(draft_plan, "-ctvd", draft_plan.kv_type.c_str()));
 

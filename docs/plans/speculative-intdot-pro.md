@@ -25,7 +25,7 @@ Background: the discussion that produced this plan, and
 ## Key facts to start from (verified on 2026-11-03)
 
 - The pinned llama.cpp already has speculative decoding with draft models
-  (`-md` / `--spec-draft-model`, `--draft-max`, `--draft-min`,
+  (`-md` / `--spec-draft-model`, `--spec-draft-n-max`, `--spec-draft-n-min`,
   `--spec-draft-ngl`) and an MTP type `COMMON_SPECULATIVE_TYPE_DRAFT_MTP`
   (`common/common.h:178`), selected with `--spec-type` (`common/arg.cpp:4284`)
   or `--mtp` (`common/arg.cpp:3097`). It discovers an MTP head as a
@@ -113,8 +113,8 @@ Files: `ps5/app/model_plan.hpp`, `model_plan.cpp`, `model_plan_test.cpp`.
      say so. Never fail a model only because speculation did not fit.
 3. Append arguments (exact names verified in 1.1):
    - `mtp`: `--spec-type <mtp-type>` (plus `-md <sidecar>` if a sidecar),
-     `--draft-max N --draft-min M`.
-   - `draft`: `-md <path> --spec-draft-ngl 999 --draft-max N --draft-min M`.
+     `--spec-draft-n-max N --spec-draft-n-min M`.
+   - `draft`: `--spec-type draft-simple -md <path> --spec-draft-ngl 999 --spec-draft-n-max N --spec-draft-n-min M`.
 4. Add `Plan::spec_gib` and `Plan::spec_mode` and show them in the planner's
    one-line `why`.
 5. Tests: fits with spec; spec dropped when tight; context shrinks before

@@ -13,8 +13,8 @@ mountpoint -q "$rootfs/proc" || mount -t proc proc "$rootfs/proc"
 mountpoint -q "$rootfs/dev" || mount --rbind /dev "$rootfs/dev"
 cp -f /etc/resolv.conf "$rootfs/etc/resolv.conf" 2>/dev/null || true
 
-# Sync probe.cpp and any modified source files from host workspace into docker work volume
-cp -f /mnt/c/Users/Igor/PS5LM/ps5/app/probe.cpp /var/lib/docker/volumes/ps5lm-native-20261101/_data/PS5LM/ps5/app/probe.cpp
+# Sync modified source files from host workspace into docker work volume
+cp -rf /mnt/c/Users/Igor/PS5LM/ps5/app/* /var/lib/docker/volumes/ps5lm-native-20261101/_data/PS5LM/ps5/app/
 cp -f /mnt/c/Users/Igor/PS5LM/scripts/release-app.sh /var/lib/docker/volumes/ps5lm-native-20261101/_data/PS5LM/scripts/release-app.sh
 cp -f /mnt/c/Users/Igor/PS5LM/build/package_deploy.py /var/lib/docker/volumes/ps5lm-native-20261101/_data/PS5LM/build/package_deploy.py
 

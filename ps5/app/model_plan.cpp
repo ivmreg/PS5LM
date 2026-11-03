@@ -1298,9 +1298,10 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
         p.args = { "-m", m.path, "-ngl", "999", "-fit", "off", "-lm", "none",
                    "-c", std::to_string(p.ctx), "-fa", "on", "-ctk", p.kv_type, "-ctv", p.kv_type,
                    "-b", wide ? "2048" : "256", "-ub", wide ? "2048" : "64", "-np", "1",
-                   // One prompt checkpoint and no RAM cache: llama-server's defaults
-                   // (32 checkpoints, 8 GiB) are for a PC, and the CPU shares this pool.
-                   "-ctxcp", "1", "-cram", "0",
+                   // Context checkpoints disabled (-ctxcp 0): on Vulkan, restoring checkpoints
+                   // triggers unmapped state seq restoration, causing SIGSEGV bad ptr crashes.
+                   // No RAM cache (-cram 0): CPU shares the unified pool.
+                   "-ctxcp", "0", "-cram", "0",
                    "--host", "0.0.0.0", "--port", "8081" };
         if (!m.mmproj.empty()) {
             p.args.insert(p.args.end(), { "--mmproj", m.mmproj });
@@ -1311,11 +1312,12 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
                 p.args.insert(p.args.end(), { "-md", spec_draft_path, "--spec-draft-ngl", "999" });
             }
             p.args.insert(p.args.end(), { "-ctkd", p.kv_type, "-ctvd", p.kv_type,
-                                          "--draft-max", std::to_string(draft_max), "--draft-min", std::to_string(draft_min) });
+                                          "--spec-draft-n-max", std::to_string(draft_max), "--spec-draft-n-min", std::to_string(draft_min) });
         } else if (p.spec_mode == "draft") {
-            p.args.insert(p.args.end(), { "-md", spec_draft_path, "--spec-draft-ngl", "999",
+            p.args.insert(p.args.end(), { "--spec-type", "draft-simple",
+                                          "-md", spec_draft_path, "--spec-draft-ngl", "999",
                                           "-ctkd", p.kv_type, "-ctvd", p.kv_type,
-                                          "--draft-max", std::to_string(draft_max), "--draft-min", std::to_string(draft_min) });
+                                          "--spec-draft-n-max", std::to_string(draft_max), "--spec-draft-n-min", std::to_string(draft_min) });
         }
         if (preset) {
             p.args.insert(p.args.end(), preset->args.begin(), preset->args.end());
@@ -1410,7 +1412,7 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
                    "-c", std::to_string(p.ctx), "-fa", "on", "-ctk", p.kv_type, "-ctv", p.kv_type,
                    "-b", "256", "-ub", "1", "-np", "1",
                    "--paged-moe", "--moe-cache-mib", std::to_string(moe_cache_mib),
-                   "-ctxcp", "1", "-cram", "0",
+                   "-ctxcp", "0", "-cram", "0",
                    "--host", "0.0.0.0", "--port", "8081" };
         if (preset) {
             p.args.insert(p.args.end(), preset->args.begin(), preset->args.end());

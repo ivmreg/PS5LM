@@ -70,7 +70,7 @@ ps5lm::Live sample(float seconds, bool generating) {
     L.model_file  = "/data/PS5LM/models/Qwen3.8-27B-UD-Q2_K_XL.gguf";
     L.plan        = "64k context, q4_0 cache: 11.3 of 11.4 GiB";
     L.args = { "-m", L.model_file, "-ngl", "999", "-fit", "off", "-lm", "none", "-c", "65536", "-fa", "on",
-               "-ctk", "q4_0", "-ctv", "q4_0", "-b", "256", "-ub", "64", "-np", "1", "-ctxcp", "1", "-cram", "0",
+               "-ctk", "q4_0", "-ctv", "q4_0", "-b", "256", "-ub", "64", "-np", "1", "-ctxcp", "0", "-cram", "0",
                "--host", "0.0.0.0", "--port", "8081", "--temp", "0.6", "--top-p", "0.95", "--top-k", "20",
                "--min-p", "0", "--metrics" };
     L.soc_temp    = 61;

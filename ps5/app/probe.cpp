@@ -18,6 +18,7 @@
 #endif
 
 #ifdef __PROSPERO__
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -30,19 +31,7 @@
 #include "ggml-backend.h"
 
 extern "C" {
-__attribute__((weak)) int sceKernelGetHwModelName(char * name);
-long   sceKernelGetCpuFrequency(void);
-size_t sceKernelGetDirectMemorySize(void);
-int    sceKernelAvailableDirectMemorySize(off_t search_start, off_t search_end, size_t alignment,
-                                          int64_t * phys_out, size_t * size_out);
-int    sceKernelAllocateDirectMemory(off_t search_start, off_t search_end, size_t len,
-                                     size_t alignment, int memory_type, off_t * phys_out);
-int    sceKernelMapDirectMemory(void ** addr, size_t len, int prot, int flags,
-                                off_t direct_start, size_t alignment);
-int    sceKernelReleaseDirectMemory(off_t start, size_t len);
-int    sceKernelMunmap(void * addr, size_t len);
-
-PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance instance, const char * name);
+long sceKernelGetCpuFrequency(void);
 }
 
 #ifndef VK_KHR_shader_integer_dot_product
@@ -297,7 +286,6 @@ void probe_vulkan(VulkanProbeReport & rep, const std::function<void(const char *
                 pfnDestroyInstance(instance, nullptr);
             }
         }
-    }
 
     if (rep.device_name.empty()) {
         for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
@@ -396,10 +384,10 @@ CpuBandwidthReport measure_cpu_bandwidth(size_t buffer_bytes) {
     void * p           = nullptr;
     bool   from_direct = false;
 #ifdef __PROSPERO__
-    off_t  phys = 0;
-    void * addr = (void *) 0x1000000000ULL;
-    int    rc   = sceKernelAllocateDirectMemory(0, (off_t) sceKernelGetDirectMemorySize(), buffer_bytes, 2 * 1024 * 1024,
-                                                12, &phys);
+    int64_t phys = 0;
+    void *  addr = (void *) 0x1000000000ULL;
+    int     rc   = sceKernelAllocateDirectMemory(0, (int64_t) sceKernelGetDirectMemorySize(), buffer_bytes, 2 * 1024 * 1024,
+                                                 12, &phys);
     if (rc == 0) {
         rc = sceKernelMapDirectMemory(&addr, buffer_bytes, 0x33, 0, phys, 2 * 1024 * 1024);
         if (rc == 0) {
@@ -525,10 +513,17 @@ ProbeReport run_console_probe(std::function<void(const char *)> on_phase) {
         on_phase("reading hardware model and firmware");
     }
     char model_buf[256] = {};
-    if (&sceKernelGetHwModelName != nullptr && sceKernelGetHwModelName(model_buf) == 0 && model_buf[0] != '\0') {
+    using pfn_get_hw_model = int (*)(char *);
+    auto fn_get_hw_model = reinterpret_cast<pfn_get_hw_model>(dlsym(RTLD_DEFAULT, "sceKernelGetHwModelName"));
+    if (fn_get_hw_model && fn_get_hw_model(model_buf) == 0 && model_buf[0] != '\0') {
         report.console_model = model_buf;
     } else {
-        report.console_model = "unknown";
+        size_t len = sizeof(model_buf);
+        if (sysctlbyname("machdep.hw_model_name", model_buf, &len, nullptr, 0) == 0 && model_buf[0] != '\0') {
+            report.console_model = model_buf;
+        } else {
+            report.console_model = "unknown";
+        }
     }
     report.is_pro = is_pro_model(report.console_model);
 
@@ -570,8 +565,8 @@ ProbeReport run_console_probe(std::function<void(const char *)> on_phase) {
     }
 
     for (size_t len = start_len; len >= kChunk256M; len -= kChunk256M) {
-        off_t phys = 0;
-        int   rc   = sceKernelAllocateDirectMemory(0, (off_t) pool, len, kAlign2M, 12, &phys);
+        int64_t phys = 0;
+        int     rc   = sceKernelAllocateDirectMemory(0, (int64_t) pool, len, kAlign2M, 12, &phys);
         if (rc == 0) {
             void * addr = (void *) 0x1000000000ULL;
             rc          = sceKernelMapDirectMemory(&addr, len, 0x33, 0, phys, kAlign2M);

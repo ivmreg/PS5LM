@@ -142,21 +142,28 @@ double run_bandwidth(unsigned char * buf, size_t len, int threads) {
     }
     pthread_t    th[3];
     BwJob        jobs[3];
+    bool         started[3] = { false, false, false };
     const int    nthreads = std::min(threads, 3);
     const size_t slice    = (len / nthreads) & ~(size_t) 127;
     const double t0       = now_s();
     for (int i = 0; i < nthreads; ++i) {
         jobs[i] = { buf + i * slice, slice, 0 };
-        pthread_create(&th[i], nullptr, bw_reader, &jobs[i]);
+        started[i] = pthread_create(&th[i], nullptr, bw_reader, &jobs[i]) == 0;
     }
     for (int i = 0; i < nthreads; ++i) {
-        pthread_join(th[i], nullptr);
+        if (started[i]) {
+            pthread_join(th[i], nullptr);
+        }
     }
     const double dt = now_s() - t0;
     if (dt <= 0.0) {
         return 0.0;
     }
-    return (double) slice * nthreads * 2 / dt / 1e9;
+    size_t used = 0;
+    for (int i = 0; i < nthreads; ++i) {
+        used += started[i] ? 1 : 0;
+    }
+    return (double) slice * used * 2 / dt / 1e9;
 }
 
 #ifdef __PROSPERO__
@@ -262,9 +269,19 @@ void probe_vulkan(VulkanProbeReport & rep, const std::function<void(const char *
                         VkPhysicalDeviceSubgroupProperties subgroup_props = {};
                         subgroup_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
 
+                        // Chain the dot-product query only when the extension is advertised.
+                        bool has_int_dot = false;
+                        for (const auto & e : rep.extensions) {
+                            if (e == "VK_KHR_shader_integer_dot_product") {
+                                has_int_dot = true;
+                                break;
+                            }
+                        }
                         VkPhysicalDeviceShaderIntegerDotProductPropertiesKHR dot_props = {};
                         dot_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES_KHR;
-                        subgroup_props.pNext = &dot_props;
+                        if (has_int_dot) {
+                            subgroup_props.pNext = &dot_props;
+                        }
 
                         VkPhysicalDeviceProperties2 props2 = {};
                         props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
@@ -273,12 +290,14 @@ void probe_vulkan(VulkanProbeReport & rep, const std::function<void(const char *
                         pfnGetPhysicalDeviceProperties2(pdev, &props2);
 
                         rep.subgroup_size = subgroup_props.subgroupSize;
-                        rep.int_dot_product_4x8_signed = dot_props.integerDotProduct4x8BitPackedSignedAccelerated != 0;
-                        rep.int_dot_product_4x8_unsigned =
-                            dot_props.integerDotProduct4x8BitPackedUnsignedAccelerated != 0;
-                        rep.int_dot_product_mixed =
-                            (dot_props.integerDotProduct4x8BitPackedMixedSignednessAccelerated != 0) ||
-                            (dot_props.integerDotProduct8BitMixedSignednessAccelerated != 0);
+                        if (has_int_dot) {
+                            rep.int_dot_product_4x8_signed = dot_props.integerDotProduct4x8BitPackedSignedAccelerated != 0;
+                            rep.int_dot_product_4x8_unsigned =
+                                dot_props.integerDotProduct4x8BitPackedUnsignedAccelerated != 0;
+                            rep.int_dot_product_mixed =
+                                (dot_props.integerDotProduct4x8BitPackedMixedSignednessAccelerated != 0) ||
+                                (dot_props.integerDotProduct8BitMixedSignednessAccelerated != 0);
+                        }
                     }
                 }
             }
@@ -327,8 +346,8 @@ void probe_vulkan(VulkanProbeReport & rep, const std::function<void(const char *
                     ggml_backend_buffer_t b_src = ggml_backend_alloc_buffer(backend, ggml_nbytes(t_src));
                     ggml_backend_buffer_t b_dst = ggml_backend_alloc_buffer(backend, ggml_nbytes(t_dst));
                     if (b_src && b_dst) {
-                        ggml_backend_tensor_alloc(b_src, t_src, nullptr);
-                        ggml_backend_tensor_alloc(b_dst, t_dst, nullptr);
+                        ggml_backend_tensor_alloc(b_src, t_src, ggml_backend_buffer_get_base(b_src));
+                        ggml_backend_tensor_alloc(b_dst, t_dst, ggml_backend_buffer_get_base(b_dst));
                         ggml_backend_buffer_clear(b_src, 1);
                         ggml_backend_buffer_clear(b_dst, 0);
                         ggml_backend_synchronize(backend);
@@ -461,7 +480,7 @@ std::string format_probe_json(const ProbeReport & report) {
     cpu["read_3threads_gbps"] = report.cpu_bandwidth.read_3threads_gbps;
     j["cpu_bandwidth"]        = cpu;
 
-    return j.dump(2) + "\n";
+    return j.dump(2, ' ', false, nlohmann::json::error_handler_t::replace) + "\n";
 }
 
 bool write_probe_report(const std::string & path, const ProbeReport & report, std::string * error) {
@@ -485,13 +504,18 @@ bool write_probe_report(const std::string & path, const ProbeReport & report, st
         unlink(tmp_path.c_str());
         return false;
     }
-    std::fflush(f);
+    bool flushed = std::fflush(f) == 0;
 #if !defined(_WIN32)
-    fsync(fileno(f));
+    if (flushed) {
+        flushed = fsync(fileno(f)) == 0;
+    }
 #endif
     if (std::fclose(f) != 0) {
+        flushed = false;
+    }
+    if (!flushed) {
         if (error) {
-            *error = "fclose failed on " + tmp_path + ": " + std::strerror(errno);
+            *error = "flush failed on " + tmp_path + ": " + std::strerror(errno);
         }
         unlink(tmp_path.c_str());
         return false;

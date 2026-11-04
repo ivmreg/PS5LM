@@ -28,6 +28,15 @@ constexpr uint64_t align_up(uint64_t offset, uint64_t alignment) {
     return (offset + alignment - 1) & ~(alignment - 1);
 }
 
+bool checked_align_up(uint64_t value, uint64_t alignment, uint64_t & out) {
+    if (alignment == 0 || (alignment & (alignment - 1)) != 0 ||
+        value > UINT64_MAX - (alignment - 1)) {
+        return false;
+    }
+    out = (value + alignment - 1) & ~(alignment - 1);
+    return true;
+}
+
 struct GgmlQuantTraits {
     uint32_t block_size;
     uint32_t type_size;
@@ -190,6 +199,22 @@ std::string lower(std::string s) {
     return s;
 }
 
+// True when `token` appears in `name` as a whole word (not inside another word).
+bool has_name_token(const std::string & name, const char * token) {
+    const std::string needle = token;
+    size_t at = 0;
+    while ((at = name.find(needle, at)) != std::string::npos) {
+        const bool left = at == 0 || !std::isalnum((unsigned char) name[at - 1]);
+        const size_t end = at + needle.size();
+        const bool right = end == name.size() || !std::isalnum((unsigned char) name[end]);
+        if (left && right) {
+            return true;
+        }
+        at = end;
+    }
+    return false;
+}
+
 std::string basename(const std::string & path) {
     const size_t slash = path.find_last_of("/\\");
     return slash == std::string::npos ? path : path.substr(slash + 1);
@@ -323,6 +348,25 @@ bool checked_add(uint64_t a, uint64_t b, uint64_t & out) {
 bool checked_mul(uint64_t a, uint64_t b, uint64_t & out) {
     if (a && b > UINT64_MAX / a) return false;
     out = a * b;
+    return true;
+}
+
+// Parses a non-empty decimal string into uint32_t without throwing.
+bool parse_u32_decimal(const std::string & text, uint32_t & out) {
+    if (text.empty() || text.size() > 10) {
+        return false;
+    }
+    uint64_t value = 0;
+    for (const char c : text) {
+        if (c < '0' || c > '9') {
+            return false;
+        }
+        value = value * 10 + (uint64_t) (c - '0');
+        if (value > UINT32_MAX) {
+            return false;
+        }
+    }
+    out = (uint32_t) value;
     return true;
 }
 
@@ -796,8 +840,7 @@ ModelInfo parse_model_info(Reader r, const std::string & path, uint64_t file_byt
                             for (char c : lstr) {
                                 if (!std::isdigit((unsigned char) c)) all_digits = false;
                             }
-                            if (all_digits) {
-                                layer_idx = (uint32_t) std::stoul(lstr);
+                            if (all_digits && parse_u32_decimal(lstr, layer_idx)) {
                                 const std::string suffix = t.name.substr(dot2 + 1);
                                 if (suffix == "ffn_gate_exps.weight") {
                                     role = "gate";
@@ -874,58 +917,97 @@ ModelInfo parse_model_info(Reader r, const std::string & path, uint64_t file_byt
                 m.moe_paging_error = expert_err;
             } else {
                 uint64_t total_exp_bytes = 0;
-                for (uint32_t l = 0; l < m.n_layer; ++l) {
-                    total_exp_bytes += layer_experts[l].gate->nbytes;
-                    total_exp_bytes += layer_experts[l].up->nbytes;
-                    total_exp_bytes += layer_experts[l].down->nbytes;
+                bool expert_bytes_ok = true;
+                for (uint32_t l = 0; l < m.n_layer && expert_bytes_ok; ++l) {
+                    for (const ParsedTensor * t : { layer_experts[l].gate, layer_experts[l].up, layer_experts[l].down }) {
+                        uint64_t sum = 0;
+                        if (!checked_add(total_exp_bytes, t->nbytes, sum)) {
+                            expert_bytes_ok = false;
+                            break;
+                        }
+                        total_exp_bytes = sum;
+                    }
                 }
-                m.expert_bytes = total_exp_bytes;
-                m.non_expert_bytes = m.file_bytes >= total_exp_bytes ? m.file_bytes - total_exp_bytes : 0;
+                if (!expert_bytes_ok) {
+                    m.moe_paging_supported = false;
+                    m.moe_paging_error = "expert tensor byte count overflows";
+                } else {
+                    m.expert_bytes = total_exp_bytes;
+                    m.non_expert_bytes = m.file_bytes >= total_exp_bytes ? m.file_bytes - total_exp_bytes : 0;
 
-                struct TensorSig {
-                    uint32_t type = 0;
-                    uint64_t ne[3] = {};
-                    uint64_t nb2 = 0;
-                    bool operator<(const TensorSig & o) const {
-                        return std::tie(type, ne[0], ne[1], ne[2], nb2) <
-                               std::tie(o.type, o.ne[0], o.ne[1], o.ne[2], o.nb2);
-                    }
-                };
-                struct GroupSig {
-                    TensorSig gate;
-                    TensorSig up;
-                    TensorSig down;
-                    bool operator<(const GroupSig & o) const {
-                        return std::tie(gate, up, down) < std::tie(o.gate, o.up, o.down);
-                    }
-                };
-                std::set<GroupSig> unique_groups;
-                for (uint32_t l = 0; l < m.n_layer; ++l) {
-                    const auto & le = layer_experts[l];
-                    GroupSig sig = {
-                        { le.gate->type, { le.gate->ne[0], le.gate->ne[1], le.gate->ne[2] }, le.gate->nb2 },
-                        { le.up->type,   { le.up->ne[0],   le.up->ne[1],   le.up->ne[2]   }, le.up->nb2 },
-                        { le.down->type, { le.down->ne[0], le.down->ne[1], le.down->ne[2] }, le.down->nb2 },
+                    struct TensorSig {
+                        uint32_t type = 0;
+                        uint64_t ne[3] = {};
+                        uint64_t nb2 = 0;
+                        bool operator<(const TensorSig & o) const {
+                            return std::tie(type, ne[0], ne[1], ne[2], nb2) <
+                                   std::tie(o.type, o.ne[0], o.ne[1], o.ne[2], o.nb2);
+                        }
                     };
-                    unique_groups.insert(sig);
-                }
+                    struct GroupSig {
+                        TensorSig gate;
+                        TensorSig up;
+                        TensorSig down;
+                        bool operator<(const GroupSig & o) const {
+                            return std::tie(gate, up, down) < std::tie(o.gate, o.up, o.down);
+                        }
+                    };
+                    std::set<GroupSig> unique_groups;
+                    for (uint32_t l = 0; l < m.n_layer; ++l) {
+                        const auto & le = layer_experts[l];
+                        GroupSig sig = {
+                            { le.gate->type, { le.gate->ne[0], le.gate->ne[1], le.gate->ne[2] }, le.gate->nb2 },
+                            { le.up->type,   { le.up->ne[0],   le.up->ne[1],   le.up->ne[2]   }, le.up->nb2 },
+                            { le.down->type, { le.down->ne[0], le.down->ne[1], le.down->ne[2] }, le.down->nb2 },
+                        };
+                        unique_groups.insert(sig);
+                    }
 
-                const uint64_t slots_min = std::min<uint64_t>(m.n_expert_used, m.n_expert);
-                uint64_t group_bytes_sum = 0;
-                uint64_t max_slice_bytes = 0;
-                for (const auto & g : unique_groups) {
-                    const uint64_t g_min = align_up(g.gate.nb2 * (slots_min + 1), 1024ull) +
-                                           align_up(g.up.nb2   * (slots_min + 1), 1024ull) +
-                                           align_up(g.down.nb2 * (slots_min + 1), 1024ull);
-                    const uint64_t staging = std::max({ g.gate.nb2, g.up.nb2, g.down.nb2 }) * kMoeUploadBatchCapacity;
-                    group_bytes_sum += g_min + staging;
-                    max_slice_bytes = std::max({ max_slice_bytes, g.gate.nb2, g.up.nb2, g.down.nb2 });
+                    const uint64_t slots_min = std::min<uint64_t>(m.n_expert_used, m.n_expert);
+                    uint64_t group_bytes_sum = 0;
+                    uint64_t max_slice_bytes = 0;
+                    bool budget_ok = true;
+                    for (const auto & g : unique_groups) {
+                        uint64_t g_min = 0;
+                        for (const uint64_t stride : { g.gate.nb2, g.up.nb2, g.down.nb2 }) {
+                            uint64_t padded = 0;
+                            uint64_t scaled = 0;
+                            if (!checked_mul(stride, slots_min + 1, scaled) ||
+                                !checked_align_up(scaled, 1024ull, padded) ||
+                                !checked_add(g_min, padded, g_min)) {
+                                budget_ok = false;
+                                break;
+                            }
+                        }
+                        uint64_t staging = 0;
+                        if (!checked_mul(std::max({ g.gate.nb2, g.up.nb2, g.down.nb2 }),
+                                         kMoeUploadBatchCapacity, staging) ||
+                            !checked_add(group_bytes_sum, g_min, group_bytes_sum) ||
+                            !checked_add(group_bytes_sum, staging, group_bytes_sum)) {
+                            budget_ok = false;
+                            break;
+                        }
+                        max_slice_bytes = std::max({ max_slice_bytes, g.gate.nb2, g.up.nb2, g.down.nb2 });
+                    }
+                    uint64_t host_map_bytes = 0;
+                    uint64_t host_map_per_layer = 0;
+                    if (!checked_mul((uint64_t) m.n_expert, 4ull, host_map_per_layer) ||
+                        !checked_align_up(host_map_per_layer, 1024ull, host_map_per_layer) ||
+                        !checked_mul((uint64_t) m.n_layer, host_map_per_layer, host_map_bytes) ||
+                        !checked_add(group_bytes_sum, host_map_bytes, m.moe_cache_min_bytes)) {
+                        budget_ok = false;
+                    }
+                    if (!budget_ok) {
+                        m.moe_cache_min_bytes = 0;
+                        m.moe_max_expert_slice_bytes = 0;
+                        m.moe_paging_supported = false;
+                        m.moe_paging_error = "expert paging cache budget overflows";
+                    } else {
+                        m.moe_max_expert_slice_bytes = max_slice_bytes;
+                        m.moe_paging_supported = true;
+                        m.moe_paging_error.clear();
+                    }
                 }
-                const uint64_t host_map_bytes = (uint64_t) m.n_layer * align_up((uint64_t) m.n_expert * 4ull, 1024ull);
-                m.moe_cache_min_bytes = group_bytes_sum + host_map_bytes;
-                m.moe_max_expert_slice_bytes = max_slice_bytes;
-                m.moe_paging_supported = true;
-                m.moe_paging_error.clear();
             }
         }
     } else {
@@ -973,7 +1055,8 @@ bool same_model_identity(const ModelInfo & a, const ModelInfo & b) {
     }
     const bool a_has_name = a.name != a.file_name;
     const bool b_has_name = b.name != b.file_name;
-    return a_has_name == b_has_name && (!a_has_name || a.name == b.name);
+    // A shard may omit general.name; only compare when both carry one.
+    return !a_has_name || !b_has_name || a.name == b.name;
 }
 
 std::string split_shard_name(const std::string & prefix, uint32_t index, uint32_t count) {
@@ -1360,7 +1443,7 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
         const double moe_cache_gib = (double) moe_cache_mib / 1024.0;
         const double staging_gib = (double) std::max<uint64_t>(m.moe_max_expert_slice_bytes * kMoeUploadBatchCapacity * 2ull, 64ull << 20) / kGiB;
         const double effective_weights_gib = non_expert_weights_gib + moe_cache_gib;
-        const double paged_reserve_gib = 0.75 + p.state_gib + staging_gib;
+        const double paged_reserve_gib = base_reserve_gib + p.state_gib + staging_gib;
 
         // Use the selected profile and caps unchanged. Long-context mode backs down only when a candidate does not fit.
         const std::vector<PlanCandidate> paged_candidates = enumerate_candidates(
@@ -1455,7 +1538,8 @@ std::vector<std::string> find_models(const std::vector<std::string> & dirs) {
                 continue;
             }
             // Vision projectors and MTP sidecars are not models on their own.
-            if (lower(n).find("mmproj") != std::string::npos || lower(n).find("mtp") != std::string::npos) {
+            const std::string folded = lower(n);
+            if (has_name_token(folded, "mmproj") || has_name_token(folded, "mtp")) {
                 continue;
             }
             out.push_back(d + "/" + n);

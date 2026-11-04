@@ -17,6 +17,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+POSIX = os.name != 'nt'
 
 # One locked record makes overlapping fake compiler processes observable without
 # timing assertions. Both the C and C++ paths use this executable.
@@ -57,6 +58,7 @@ sys.exit(17 if failed else 0)
 '''
 
 
+@unittest.skipUnless(POSIX, 'requires a POSIX host (bash, fcntl)')
 class BuildAppQueueTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -169,6 +171,7 @@ class BuildAppQueueTests(unittest.TestCase):
         self.assertEqual(len(state['started']), 5)
 
 
+@unittest.skipUnless(POSIX, 'requires a POSIX host (bash)')
 class NativeBuildPreflightTests(unittest.TestCase):
     def test_early_failure_removes_previous_success_report(self):
         cases = (

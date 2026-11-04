@@ -76,6 +76,14 @@ int main() {
     write_text(path, "{\"planning_profile\":null}\n");
     assert(ps5lm::load_settings(path.c_str()).planning_profile == "long_context");
 
+    // Invalid kv_type falls back to auto instead of making every plan fail.
+    write_text(path, "{\"kv_type\":\"bogus\"}\n");
+    assert(ps5lm::load_settings(path.c_str()).kv_type == "auto");
+    write_text(path, "{\"kv_type\":42}\n");
+    assert(ps5lm::load_settings(path.c_str()).kv_type == "auto");
+    write_text(path, "{\"kv_type\":\"q4_0\"}\n");
+    assert(ps5lm::load_settings(path.c_str()).kv_type == "q4_0");
+
     // Malformed paged_moe tests
     write_text(path, "{\"paged_moe\":1}\n");
     assert(ps5lm::load_settings(path.c_str()).paged_moe == false);

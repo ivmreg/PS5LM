@@ -346,6 +346,11 @@ int main(int argc, char ** argv) {
     assert(std::find(paged_plan.args.begin(), paged_plan.args.end(), "--paged-moe") != paged_plan.args.end());
     assert(paged_plan.why.find("paged MoE (2048 MiB cache)") == 0);
 
+    // The safety threshold applies to paged plans too.
+    const ps5lm::Plan paged_tight = ps5lm::plan_model(qm, budget, 65536, nullptr, "long_context", true, 2048, 384);
+    assert(paged_tight.fits && paged_tight.paged_moe);
+    assert(std::fabs((paged_plan.reserve_gib - paged_tight.reserve_gib) - 384.0 / 1024.0) < 1e-9);
+
     // A resident fit stays resident even when paging is enabled and the cache request is too small.
     ps5lm::ModelInfo resident_moe = qm;
     resident_moe.file_bytes = 1ull << 30;
@@ -419,6 +424,19 @@ int main(int argc, char ** argv) {
     assert(tiny.non_expert_bytes == 107488);
     assert(tiny.moe_cache_min_bytes == 36864);
     assert(tiny.moe_max_expert_slice_bytes == 2048);
+
+    // A malformed layer index must be rejected, not throw out of the header parser.
+    Gguf huge_layer;
+    huge_layer.kv("general.architecture", "qwen3moe").kv("general.name", "Huge layer")
+        .kv("qwen3moe.block_count", 1u).kv("qwen3moe.attention.head_count", 1u)
+        .kv("qwen3moe.attention.head_count_kv", 1u).kv("qwen3moe.embedding_length", 8u)
+        .kv("qwen3moe.context_length", 8u).kv("qwen3moe.expert_count", 2u)
+        .kv("qwen3moe.expert_used_count", 1u)
+        .tensor("blk.99999999999999999999.ffn_gate_exps.weight", { 8, 8, 2 }, 0);
+    const ps5lm::ModelInfo huge = ps5lm::read_model_header("huge-layer.gguf", huge_layer.bytes(), 1ull << 20);
+    assert(huge.ok);
+    assert(!huge.moe_paging_supported);
+    assert(huge.moe_paging_error.find("unrecognized expert tensor") != std::string::npos);
 
     // =========================================================================
 

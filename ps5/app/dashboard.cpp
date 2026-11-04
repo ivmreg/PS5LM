@@ -133,8 +133,8 @@ constexpr int kDiagnostics = 5;
 constexpr uint32_t     kCtxSteps[] = { 4096, 8192, 16384, 32768, 65536, 131072 };
 constexpr const char * kKvSteps[] = { "auto", "f16", "q8_0", "q4_0" };
 constexpr const char * kPlanningProfileSteps[] = { "long_context", "balanced", "kv_precision" };
-constexpr uint32_t     kReserveSteps[] = { 256, 384, 512, 768, 1024 };
-constexpr uint32_t     kMoeCacheSteps[] = { 1024, 1536, 2048, 3072, 4096 };
+constexpr uint32_t     kReserveSteps[] = { 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096 };
+constexpr uint32_t     kMoeCacheSteps[] = { 128, 256, 512, 1024, 1536, 2048, 3072, 4096, 6144, 8192 };
 constexpr uint32_t     kScratchSteps[] = { 1, 2, 5, 10, 20 };
 
 constexpr int   kLogLines = 20;
@@ -511,19 +511,16 @@ std::vector<Choice> choices_of(const Settings & s, Setting id, const std::vector
             break;
         }
         case Setting::reserve_mib: {
-            const char * notes[] = {
-                "Minimal (fits 64k on 27B UD-Q2_K_XL)",
-                "Tight (extra room for KV cache)",
-                "Balanced headroom",
-                "Default conservative headroom",
-                "Extra safety headroom"
-            };
-            for (int i = 0; i < 5; ++i) {
-                const uint32_t m = kReserveSteps[i];
+            for (const uint32_t m : kReserveSteps) {
                 const std::string label = m == 768 ? "768 MB (Default)"
                                         : m >= 1024 ? format("%.1f GB", m / 1024.0)
                                         : format("%u MB", m);
-                add(label, notes[i], s.reserve_mib == m, [m](Settings & v) { v.reserve_mib = m; });
+                const char * note = m == 768 ? "Default conservative headroom"
+                                  : m <= 256 ? "Minimal headroom (longest context)"
+                                  : m <= 512 ? "Tight headroom"
+                                  : m <= 1024 ? "Extra safety headroom"
+                                  : "Very conservative headroom";
+                add(label, note, s.reserve_mib == m, [m](Settings & v) { v.reserve_mib = m; });
             }
             break;
         }

@@ -24,10 +24,10 @@ index 6bc4a84..9d48ecd 100644
          {"-ncffn", "--n-cpu-ffn"}, "N",
          "keep the dense FFN weights of the first N layers in the CPU\n"
 diff --git a/common/common.cpp b/common/common.cpp
-index d82a5ee..d29ec3c 100644
+index c5db228..02ddcfb 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
-@@ -1261,7 +1261,7 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+@@ -1241,7 +1241,7 @@ common_init_result::common_init_result(common_params & params, bool model_only)
      auto mparams = common_model_params_to_llama(params);
      auto cparams = common_context_params_to_llama(params);
  
@@ -36,7 +36,7 @@ index d82a5ee..d29ec3c 100644
          COM_TRC("%s", "fitting params to device memory ...\n");
          COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
  
-@@ -1722,6 +1722,19 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+@@ -1702,6 +1702,19 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
      mparams.progress_callback           = params.load_progress_callback;
      mparams.progress_callback_user_data = params.load_progress_callback_user_data;
      mparams.no_alloc                    = params.no_alloc;
@@ -57,10 +57,10 @@ index d82a5ee..d29ec3c 100644
  
      return mparams;
 diff --git a/common/common.h b/common/common.h
-index b6bb185..e6b8f79 100644
+index b6683fe..03571bc 100644
 --- a/common/common.h
 +++ b/common/common.h
-@@ -598,6 +598,7 @@ struct common_params {
+@@ -594,6 +594,7 @@ struct common_params {
      ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
  
      size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
@@ -124,7 +124,7 @@ index 97250c2..46a2fa1 100644
  target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
  
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index bc93c6f..0c28819 100644
+index bc93c6f..291760f 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -15,6 +15,10 @@
@@ -287,7 +287,7 @@ index bc93c6f..0c28819 100644
 +            if (stat(file_paths[weight.idx].c_str(), &st) != 0 || st.st_size < 0 || static_cast<uint64_t>(st.st_size) != file_size) {
 +                throw std::runtime_error(format("unable to validate source shard identity for %s", tensor_name.c_str()));
 +            }
-+            identity.available = true;
++            identity.available = st.st_ino != 0;
 +            identity.device = static_cast<uint64_t>(st.st_dev);
 +            identity.inode = static_cast<uint64_t>(st.st_ino);
 +#else
@@ -403,7 +403,7 @@ index ed59079..0f0b85b 100644
  
      // byte range within a mapped file
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index aeab7b7..1bfb12c 100644
+index aeab7b7..3b15d4d 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -1265,6 +1265,12 @@ struct llama_model::impl {
@@ -419,33 +419,21 @@ index aeab7b7..1bfb12c 100644
  };
  
  bool llama_prec_policy::apply(ggml_tensor * res) const {
-@@ -1849,6 +1855,25 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1849,6 +1855,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
  
      ml.done_getting_tensors();
  
 +    if (ml.use_moe_expert_paging) {
-+        if (ml.paged_expert_descriptors.size() != static_cast<std::size_t>(n_layer_all) * 3) {
++        if (ml.paged_expert_descriptors.size() != static_cast<std::size_t>(hparams.n_layer()) * 3) {
 +            throw std::runtime_error(format("Qwen3MoE paging expected %d layers with gate/up/down tensors, found %zu expert tensors",
-+                n_layer_all, ml.paged_expert_descriptors.size()));
++                hparams.n_layer(), ml.paged_expert_descriptors.size()));
 +        }
-+#if !defined(_WIN32)
-+        constexpr std::size_t max_expert_bytes = 64 * 1024 * 1024;
-+        auto opened = ml.open_paged_expert_source(max_expert_bytes);
-+        if (!opened.ok()) {
-+            throw std::runtime_error(format("failed to open paged expert source (%s): %s",
-+                ps5lm::moe::read_status_name(opened.error.status), opened.error.message));
-+        }
-+        pimpl->paged_expert_source = std::move(opened.source);
-+        has_paged_experts = true;
-+#else
-+        throw std::runtime_error("MoE expert paging requires POSIX file descriptor support");
-+#endif
 +    }
 +
      if (per_layer_tok_embd && ml.lazy.has(per_layer_tok_embd)) {
          LLAMA_LOG_INFO("%s: enabling prefetch for '%s'\n", __func__, per_layer_tok_embd->name);
  
-@@ -1865,6 +1890,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1865,6 +1878,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
      for (auto & [_, ctx_ptr] : ml.ctx_map) {
          for (auto * cur = ggml_get_first_tensor(ctx_ptr.get()); cur != NULL; cur = ggml_get_next_tensor(ctx_ptr.get(), cur)) {
              tensors_by_name.emplace_back(ggml_get_name(cur), cur);
@@ -458,7 +446,7 @@ index aeab7b7..1bfb12c 100644
          }
      }
  
-@@ -1934,7 +1965,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1934,7 +1953,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
              }
          } else {
              ggml_backend_buffer_t buf;
@@ -467,7 +455,7 @@ index aeab7b7..1bfb12c 100644
                  buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
                  for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
                      t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
-@@ -1967,7 +1998,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1967,7 +1986,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
  
          pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
  
@@ -478,7 +466,7 @@ index aeab7b7..1bfb12c 100644
      }
  
      if (llama_supports_gpu_offload()) {
-@@ -2019,6 +2052,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -2019,6 +2040,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
          }
      }
  
@@ -500,7 +488,7 @@ index aeab7b7..1bfb12c 100644
      load_tensors_hadamard();
  
      return true;
-@@ -2716,6 +2764,34 @@ bool llama_model::has_tensor_overrides() const {
+@@ -2716,6 +2752,34 @@ bool llama_model::has_tensor_overrides() const {
      return pimpl->has_tensor_overrides;
  }
  
@@ -535,7 +523,7 @@ index aeab7b7..1bfb12c 100644
  const ggml_tensor * llama_model::get_tensor(const char * name) const {
      auto it = std::find_if(tensors_by_name.begin(), tensors_by_name.end(),
              [name](const std::pair<std::string, ggml_tensor *> & it) {
-@@ -3346,6 +3422,7 @@ llama_model_params llama_model_default_params() {
+@@ -3346,6 +3410,7 @@ llama_model_params llama_model_default_params() {
          /*.no_host                     =*/ false,
          /*.no_alloc                    =*/ false,
          /*.load_mtp                    =*/ false,

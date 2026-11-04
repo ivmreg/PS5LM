@@ -20,7 +20,13 @@ Settings load_settings(const char * path) {
     s.auto_load     = j.value("auto_load", s.auto_load);
     s.default_model = j.value("default_model", s.default_model);
     s.ctx_cap       = j.value("ctx_cap", s.ctx_cap);
-    s.kv_type       = j.value("kv_type", s.kv_type);
+    const auto kv = j.find("kv_type");
+    if (kv != j.end() && kv->is_string()) {
+        const std::string value = kv->get<std::string>();
+        if (value == "auto" || value == "f16" || value == "q8_0" || value == "q4_0") {
+            s.kv_type = value;
+        }
+    }
     const auto profile = j.find("planning_profile");
     if (profile != j.end() && profile->is_string()) {
         const std::string value = profile->get<std::string>();

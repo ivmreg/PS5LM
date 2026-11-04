@@ -52,7 +52,7 @@ index 67b304f..f5e7a98 100644
 +
 +#if defined(__PROSPERO__)
 +   if (sceKernelGetHwModelName) {
-+      char model[32] = {0};
++      char model[256] = {0};
 +      if (sceKernelGetHwModelName(model) == 0 && strncmp(model, "CFI-7", 5) == 0)
 +         return true;
 +   }

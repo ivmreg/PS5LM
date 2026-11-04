@@ -33,6 +33,14 @@ v0.1.x are the upstream payload releases by cobanov.
   request pays for it unless it asks.
 
 ### Fixed
+- **Console probe and paged-MoE hardening.** The probe now binds its GPU
+  bandwidth tensors to the allocated buffer base instead of `nullptr`, runs off
+  the render thread, and reports failures instead of terminating. Paged MoE
+  honours the configured safety threshold, rejects malformed layer indices
+  without throwing, and the engine clamps its slot/token limits and serializes
+  pending completion tokens. The loader's paged-source open is no longer
+  duplicated, its descriptor count excludes MTP layers, and its file identity
+  check handles `st_ino == 0`.
 - **Downloads keep their speed past 2 GB.** The console slows a title's own writes to about
   1.2 MB/s after the first ~2.2 GB, while a payload's keep going, so the app now writes each piece
   through a loopback ftpsrv: in file order, with `REST`/`STOR` at its place, done once ftpsrv answers

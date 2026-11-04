@@ -16,9 +16,11 @@ extern "C" {
 #include <chrono>
 #include <condition_variable>
 #include <cctype>
+#include <exception>
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
+#include <string>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -181,12 +183,8 @@ void Market::open_repo(int index) {
                 const std::string path = e.value("path", std::string());
                 const bool gguf = path.size() > 5 && path.compare(path.size() - 5, 5, ".gguf") == 0;
                 const SplitName split = split_name(path);
-                const size_t slash = path.find_last_of("/\\");
-                const std::string leaf = path.substr(slash == std::string::npos ? 0 : slash + 1);
-                const bool first_shard = leaf.find("-00001-of-") != std::string::npos;
                 // Projectors and later parts of split models are not models of their own.
-                if (!gguf || path.find("mmproj") != std::string::npos ||
-                    (leaf.find("-of-") != std::string::npos && !first_shard)) {
+                if (!gguf || path.find("mmproj") != std::string::npos || (split.split && !split.first)) {
                     continue;
                 }
                 MarketFile f;
@@ -197,7 +195,7 @@ void Market::open_repo(int index) {
                     f.bytes = e["lfs"].value("size", f.bytes);
                 }
                 // A shard cannot be downloaded as a complete model.
-                f.unsupported = first_shard || (split.split && split.first);
+                f.unsupported = split.split && split.first;
                 if (f.unsupported) {
                     f.fits = -3;
                     f.plan = unsupported_reason(true, false);
@@ -261,21 +259,34 @@ void Market::plan_file(int repo, int file) {
                 plans_.pop_back();
             }
             std::string error;
-            const std::string head = get_text(std::string(kHub) + "/" + job.repo + "/resolve/main/" + job.file,
-                                              "bytes=0-16777215", &error, 16u << 20);
-            const ModelInfo m = read_model_header(job.file, head, job.bytes);
-            const bool split = m.split_count > 1 || m.split_index != 0;
-            const bool unsupported = split || m.stripped_experts;
-            const Plan p = m.ok && !unsupported ? plan_model(m, budget_gib_) : Plan{};
+            bool unsupported = false;
+            bool split = false;
+            bool ok = false;
+            Plan p;
+            std::string plan_text;
+            try {
+                const std::string head = get_text(std::string(kHub) + "/" + job.repo + "/resolve/main/" + job.file,
+                                                  "bytes=0-16777215", &error, 16u << 20);
+                const ModelInfo m = read_model_header(job.file, head, job.bytes);
+                split = m.split_count > 1 || m.split_index != 0;
+                unsupported = split || m.stripped_experts;
+                p = m.ok && !unsupported ? plan_model(m, budget_gib_) : Plan{};
+                ok = m.ok;
+                plan_text = unsupported ? unsupported_reason(split, m.stripped_experts)
+                           : m.ok ? p.why : (!error.empty() ? error : m.error);
+            } catch (const std::exception & e) {
+                plan_text = std::string("header check failed: ") + e.what();
+            } catch (...) {
+                plan_text = "header check failed: unknown exception";
+            }
             std::lock_guard<std::mutex> lock(mutex_);
             for (auto & r : view_.repos) {
                 for (auto & f : r.files) {
                     if (r.id == job.repo && f.name == job.file) {
                         f.unsupported = unsupported;
-                        f.fits = unsupported ? -3 : m.ok ? (p.fits ? 1 : 0) : -2;
+                        f.fits = unsupported ? -3 : ok ? (p.fits ? 1 : 0) : -2;
                         f.checking = false;
-                        f.plan = unsupported ? unsupported_reason(split, m.stripped_experts)
-                                : m.ok ? p.why : (!error.empty() ? error : m.error);
+                        f.plan = plan_text;
                     }
                 }
             }

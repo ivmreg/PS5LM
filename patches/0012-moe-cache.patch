@@ -290,10 +290,10 @@ index f69fe63..36420f0 100644
      }
      ggml_backend_sched_set_tensor_backend(sched, slots, moe_cache->backend(il));
 diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
-index f22d986..5ba44ad 100644
+index f22d986..c10cd1d 100644
 --- a/src/llama-moe-cache.cpp
 +++ b/src/llama-moe-cache.cpp
-@@ -4,14 +4,52 @@
+@@ -4,14 +4,53 @@
  #include "llama-model.h"
  
  #include "ggml-cpp.h"
@@ -308,6 +308,7 @@ index f22d986..5ba44ad 100644
 +#include <cstdint>
 +#include <cstring>
 +#include <limits>
++#include <mutex>
  #include <stdexcept>
  #include <unordered_map>
  #include <vector>
@@ -346,7 +347,7 @@ index f22d986..5ba44ad 100644
  // LRU of the experts of a group of layers, the slot of each expert is kept in the slot map of its layer
  struct moe_cache_lru {
      int32_t n_expert = 0;
-@@ -148,7 +186,81 @@ static bool llama_moe_cache_is_host_weight(const ggml_tensor * t) {
+@@ -148,7 +187,81 @@ static bool llama_moe_cache_is_host_weight(const ggml_tensor * t) {
          ggml_backend_buffer_is_host(t->buffer);
  }
  
@@ -429,7 +430,7 @@ index f22d986..5ba44ad 100644
  
  struct llama_moe_cache::impl {
      // a GPU with its own budget and banks, it caches the layers assigned to it
-@@ -173,6 +285,14 @@ struct llama_moe_cache::impl {
+@@ -173,6 +286,14 @@ struct llama_moe_cache::impl {
          size_t host_bytes = 0;
          int32_t n_slots = 0;
          moe_cache_lru lru;
@@ -444,17 +445,18 @@ index f22d986..5ba44ad 100644
      };
  
      struct layer {
-@@ -196,6 +316,9 @@ struct llama_moe_cache::impl {
+@@ -196,6 +317,10 @@ struct llama_moe_cache::impl {
      static constexpr int64_t max_batch = 32;
  
      int32_t n_expert_used;
 +    bool is_paged_mode = false;
 +    uint64_t next_completion_token = 0;
++    std::mutex pending_mutex;
 +    bool inject_invalid_expert = false;
  
      stats stats_small; // up to 8 tokens per ubatch
      stats stats_large;
-@@ -219,7 +342,7 @@ struct llama_moe_cache::impl {
+@@ -219,7 +344,7 @@ struct llama_moe_cache::impl {
      ggml_context_ptr ctx_views;
  
      impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
@@ -463,7 +465,7 @@ index f22d986..5ba44ad 100644
          for (size_t i = 0; i < backends.size(); ++i) {
              const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
              if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-@@ -229,7 +352,13 @@ struct llama_moe_cache::impl {
+@@ -229,7 +354,13 @@ struct llama_moe_cache::impl {
              }
          }
          if (devices.empty()) {
@@ -478,7 +480,7 @@ index f22d986..5ba44ad 100644
          }
          if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
              throw std::runtime_error("MoE cache does not support tensor parallelism");
-@@ -244,7 +373,10 @@ struct llama_moe_cache::impl {
+@@ -244,7 +375,10 @@ struct llama_moe_cache::impl {
              if (experts.empty() || !std::all_of(experts.begin(), experts.end(), llama_moe_cache_is_host_weight)) {
                  continue;
              }
@@ -490,7 +492,7 @@ index f22d986..5ba44ad 100644
              if (it_dev == devices.end()) {
                  continue;
              }
-@@ -307,6 +439,36 @@ struct llama_moe_cache::impl {
+@@ -307,6 +441,36 @@ struct llama_moe_cache::impl {
              }
          }
  
@@ -527,17 +529,18 @@ index f22d986..5ba44ad 100644
          // within a device the budget is split by the size of the experts, so each group caches the same fraction of its experts
          std::vector<size_t> n_tensors(devices.size(), 0);
          size_t n_tensors_host = 0;
-@@ -318,6 +480,9 @@ struct llama_moe_cache::impl {
+@@ -318,6 +482,10 @@ struct llama_moe_cache::impl {
              while (g.n_slots < max_slots && alloc_size(g, g.n_slots + 1) <= budget) {
                  g.n_slots++;
              }
 +            if (is_paged_mode && g.n_slots < n_expert_used) {
 +                g.n_slots = n_expert_used;
 +            }
++            g.n_slots = std::min<int32_t>(g.n_slots, (int32_t) ps5lm::moe::SlotCache::kHardSlotLimit);
              if (g.n_slots < n_expert_used) {
                  LLAMA_LOG_WARN("%s: MoE cache budget is too small for %zu layers, they are not cached\n", __func__, g.layers.size());
                  g.n_slots = 0;
-@@ -351,9 +516,6 @@ struct llama_moe_cache::impl {
+@@ -351,9 +519,6 @@ struct llama_moe_cache::impl {
          ctx_host  = init_ctx(n_tensors_host);
          ctx_views = init_ctx(2);
  
@@ -547,7 +550,7 @@ index f22d986..5ba44ad 100644
          for (size_t ig = 0; ig < groups.size(); ++ig) {
              group & g = groups[ig];
              if (g.n_slots == 0) {
-@@ -427,6 +589,83 @@ struct llama_moe_cache::impl {
+@@ -427,6 +592,85 @@ struct llama_moe_cache::impl {
              }
          }
  
@@ -574,7 +577,9 @@ index f22d986..5ba44ad 100644
 +                sc_opts.slot_count = g.n_slots;
 +                sc_opts.bytes_per_slot = bytes_per_slot;
 +                sc_opts.byte_budget = alloc_size(g, g.n_slots);
-+                sc_opts.max_in_flight_tokens = std::max<size_t>(64, g.layers.size() * 2);
++                sc_opts.max_in_flight_tokens = std::min<size_t>(
++                    std::max<size_t>(64, g.layers.size() * 2),
++                    ps5lm::moe::SlotCache::kHardInFlightLimit);
 +                sc_opts.max_request_keys = 4096;
 +                g.slot_cache = std::make_unique<ps5lm::moe::SlotCache>(sc_opts);
 +                if (g.slot_cache->configuration_status() != ps5lm::moe::SlotCacheStatus::Ok) {
@@ -631,7 +636,7 @@ index f22d986..5ba44ad 100644
          // as weights, the ops that read the banks run on the device and the slot maps are copied with the copy callback
          for (device & d : devices) {
              if (d.buf) {
-@@ -466,7 +705,8 @@ struct llama_moe_cache::impl {
+@@ -466,7 +710,8 @@ struct llama_moe_cache::impl {
          const layer & l = layers[il];
  
          // large batches use most experts of a layer, so they gain little from the cache and would evict the experts used in generation
@@ -641,7 +646,7 @@ index f22d986..5ba44ad 100644
              return nullptr;
          }
          return l.slot_map;
-@@ -582,6 +822,142 @@ struct llama_moe_cache::impl {
+@@ -582,6 +827,148 @@ struct llama_moe_cache::impl {
          return true;
      }
  
@@ -695,10 +700,13 @@ index f22d986..5ba44ad 100644
 +        ids.resize(ggml_nelements(sel));
 +        if (ids.empty()) {
 +            ggml_backend_synchronize(backend);
-+            for (auto token : g.pending_completion_tokens) {
-+                g.slot_cache->complete(token);
++            {
++                std::lock_guard<std::mutex> lock(pending_mutex);
++                for (auto token : g.pending_completion_tokens) {
++                    g.slot_cache->complete(token);
++                }
++                g.pending_completion_tokens.clear();
 +            }
-+            g.pending_completion_tokens.clear();
 +            ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
 +            return GGML_BACKEND_SCHED_COPY_HANDLED;
 +        }
@@ -719,18 +727,24 @@ index f22d986..5ba44ad 100644
 +            requested.push_back(static_cast<uint32_t>(e));
 +        }
 +
-+        for (auto token : g.pending_completion_tokens) {
-+            g.slot_cache->complete(token);
++        ps5lm::moe::CompletionToken use_token = 0;
++        {
++            std::lock_guard<std::mutex> lock(pending_mutex);
++            for (auto token : g.pending_completion_tokens) {
++                g.slot_cache->complete(token);
++            }
++            g.pending_completion_tokens.clear();
++            use_token = ++next_completion_token;
 +        }
-+        g.pending_completion_tokens.clear();
-+
-+        ps5lm::moe::CompletionToken use_token = ++next_completion_token;
-+        g.pending_completion_tokens.push_back(use_token);
 +
 +        auto res = g.runtime->load_layer(static_cast<uint32_t>(il), requested, use_token);
 +        if (!res.ok()) {
 +            LLAMA_LOG_ERROR("%s: layer %d paging failed: %s\n", __func__, il, ps5lm::moe::paging_status_name(res.status));
 +            return GGML_BACKEND_SCHED_COPY_ERROR;
++        }
++        {
++            std::lock_guard<std::mutex> lock(pending_mutex);
++            g.pending_completion_tokens.push_back(use_token);
 +        }
 +
 +        // Only IDs selected by this layer's GET_ROWS are looked up from the
@@ -751,6 +765,7 @@ index f22d986..5ba44ad 100644
 +        if (!is_paged_mode) {
 +            return;
 +        }
++        std::lock_guard<std::mutex> lock(pending_mutex);
 +        for (group & g : groups) {
 +            if (g.slot_cache) {
 +                for (auto token : g.pending_completion_tokens) {
@@ -777,14 +792,10 @@ index f22d986..5ba44ad 100644
 +#endif
 +    }
 +
-+    ggml_backend_buffer_type_t buft_slot_map() const {
-+        return get_buft_slot_map();
-+    }
-+
      void log_stats() const {
          auto log = [](const char * name, const stats & st) {
              const size_t n = st.hits + st.misses;
-@@ -621,6 +997,22 @@ bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml
+@@ -621,6 +1008,18 @@ bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml
      return pimpl->copy(backend, src, dst, graph);
  }
  
@@ -796,10 +807,6 @@ index f22d986..5ba44ad 100644
 +    pimpl->complete_pending_paging();
 +}
 +
-+ggml_backend_buffer_type_t llama_moe_cache::buft_slot_map() const {
-+    return pimpl->buft_slot_map();
-+}
-+
 +void llama_moe_cache::set_fault_injection(bool enable, int countdown) {
 +    pimpl->set_fault_injection(enable, countdown);
 +}
@@ -808,7 +815,7 @@ index f22d986..5ba44ad 100644
      return pimpl->copy_experts(backend, w, dst, e, last);
  }
 diff --git a/src/llama-moe-cache.h b/src/llama-moe-cache.h
-index 3b6726b..eea8544 100644
+index 3b6726b..791661b 100644
 --- a/src/llama-moe-cache.h
 +++ b/src/llama-moe-cache.h
 @@ -8,6 +8,18 @@
@@ -830,7 +837,7 @@ index 3b6726b..eea8544 100644
  // keeps the most recently used experts of host-resident MoE layers in a device buffer
  // each layer has a slot map in host memory: when the scheduler copies it to the device, the copy callback uploads the missing experts
  class llama_moe_cache {
-@@ -28,6 +40,18 @@ public:
+@@ -28,6 +40,15 @@ public:
      // ggml_backend_sched copy callback, returns false if src is not a slot map
      bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
  
@@ -839,9 +846,6 @@ index 3b6726b..eea8544 100644
 +
 +    // complete any in-flight completion tokens in the slot cache
 +    void complete_pending_paging();
-+
-+    // buffer type used for slot maps in host memory
-+    ggml_backend_buffer_type_t buft_slot_map() const;
 +
 +    // fault injection for tests
 +    void set_fault_injection(bool enable, int countdown = 0);

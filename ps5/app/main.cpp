@@ -136,8 +136,22 @@ struct StorageProbeWorker {
 
 StorageProbeWorker g_storage_probe;
 
+struct ConsoleProbeWorker {
+    std::atomic<bool> active{ false };
+    std::atomic<bool> finished{ false };
+    pthread_t thread{};
+    bool thread_started = false;  // owned by the render/control thread
+    bool join_failed = false;     // owned by the render/control thread
+    bool saved = false;           // published by finished (release/acquire)
+    std::string error;            // published by finished (release/acquire)
+};
+
+ConsoleProbeWorker g_console_probe;
+
 void cancel_storage_probe(const char *reason);
 void poll_storage_probe_worker();
+bool start_console_probe();
+bool poll_console_probe();
 
 // The last lines of a log, up to about 64 KiB of it, oldest first.
 std::vector<std::string> tail_lines(const char * path) {
@@ -479,6 +493,9 @@ bool start_storage_probe(const std::string & path) {
         std::printf("ps5lm-app: cannot prepare storage-probe result: %s\n", std::strerror(saved_errno));
         return false;
     }
+    // A previous crash may have left the temporary report behind; O_EXCL would
+    // otherwise refuse to write the next one.
+    unlink(kStorageProbeTemp);
 
     std::memcpy(g_storage_probe.path, path.c_str(), path.size() + 1);
     g_storage_probe.cancel.store(false, std::memory_order_release);
@@ -515,6 +532,11 @@ void poll_storage_probe_worker() {
     const int rc = g_storage_probe.thread_started ? pthread_join(g_storage_probe.thread, nullptr) : 0;
     if (rc != 0) {
         std::printf("ps5lm-app: storage-probe worker join failed (pthread error %d)\n", rc);
+        // Do not retry every frame; drop the handle and let the next request start.
+        g_storage_probe.thread_started = false;
+        g_storage_probe.finished.store(false, std::memory_order_release);
+        g_storage_probe.cancel.store(false, std::memory_order_release);
+        g_storage_probe.active.store(false, std::memory_order_release);
         return;
     }
     g_storage_probe.thread_started = false;
@@ -531,6 +553,77 @@ void cancel_storage_probe(const char * reason) {
     if (!g_storage_probe.cancel.exchange(true, std::memory_order_acq_rel)) {
         std::printf("ps5lm-app: cancelling storage-probe before %s\n", reason);
     }
+}
+
+void * console_probe_worker(void *) {
+    try {
+        ProbeReport rep = run_console_probe([](const char * phase) {
+            std::printf("ps5lm-app: probe: %s\n", phase);
+        });
+        std::string err;
+        if (!write_probe_report("/data/PS5LM/probe.json", rep, &err)) {
+            g_console_probe.error = err.empty() ? "could not write probe.json" : err;
+        } else {
+            g_console_probe.saved = true;
+        }
+    } catch (const std::exception & e) {
+        g_console_probe.error = e.what();
+    } catch (...) {
+        g_console_probe.error = "unknown exception";
+    }
+    g_console_probe.finished.store(true, std::memory_order_release);
+    return nullptr;
+}
+
+bool start_console_probe() {
+    if (g_console_probe.join_failed) {
+        return false;
+    }
+    bool expected = false;
+    if (!g_console_probe.active.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        return false;
+    }
+    g_console_probe.saved = false;
+    g_console_probe.error.clear();
+    g_console_probe.finished.store(false, std::memory_order_release);
+    pthread_attr_t attr;
+    int rc = pthread_attr_init(&attr);
+    const bool attr_initialized = rc == 0;
+    if (rc == 0) {
+        rc = pthread_attr_setstacksize(&attr, 16u << 20);
+    }
+    if (rc == 0) {
+        rc = pthread_create(&g_console_probe.thread, &attr, console_probe_worker, nullptr);
+    }
+    if (rc == 0) {
+        g_console_probe.thread_started = true;
+    }
+    if (attr_initialized) {
+        pthread_attr_destroy(&attr);
+    }
+    if (rc != 0) {
+        g_console_probe.active.store(false, std::memory_order_release);
+        std::printf("ps5lm-app: console-probe worker could not start (pthread error %d)\n", rc);
+        return false;
+    }
+    return true;
+}
+
+// Returns true when a started probe has just finished and was joined.
+bool poll_console_probe() {
+    if (!g_console_probe.active.load(std::memory_order_acquire) ||
+        !g_console_probe.finished.load(std::memory_order_acquire)) {
+        return false;
+    }
+    const int rc = g_console_probe.thread_started ? pthread_join(g_console_probe.thread, nullptr) : 0;
+    if (rc != 0) {
+        std::printf("ps5lm-app: console-probe worker join failed (pthread error %d)\n", rc);
+        g_console_probe.join_failed = true;
+    }
+    g_console_probe.thread_started = false;
+    g_console_probe.finished.store(false, std::memory_order_release);
+    g_console_probe.active.store(false, std::memory_order_release);
+    return true;
 }
 
 // Where the memory is: the pool's free part, the CPU heap, and what ggml
@@ -644,9 +737,15 @@ struct Models {
         }
         scan_state = 1;
         std::thread([this, s = settings, b = budget_gib, r = running] {
-            std::vector<ModelRow> out = plan_rows(s, b, r);
-            std::lock_guard<std::mutex> lock(scan_mutex);
-            scanned = std::move(out);
+            try {
+                std::vector<ModelRow> out = plan_rows(s, b, r);
+                std::lock_guard<std::mutex> lock(scan_mutex);
+                scanned = std::move(out);
+            } catch (const std::exception & e) {
+                std::printf("ps5lm-app: model rescan failed: %s\n", e.what());
+            } catch (...) {
+                std::printf("ps5lm-app: model rescan failed: unknown exception\n");
+            }
             scan_state = 2;
         }).detach();
         (void) stats;
@@ -889,7 +988,11 @@ int main(int, char **) {
     // env.txt, set before the GPU opens; only the driver's, ggml's and llama's.
     for (const auto & line : read_lines(kEnv)) {
         const size_t eq = line.find('=');
-        const std::string name = line.substr(0, eq == std::string::npos ? 0 : eq);
+        if (eq == std::string::npos) {
+            std::printf("ps5lm-app: env %s (ignored: expected NAME=value)\n", line.c_str());
+            continue;
+        }
+        const std::string name = line.substr(0, eq);
         bool known = false;
         for (const char * prefix : { "RADV_", "MESA_", "ACO_", "GGML_", "LLAMA_" }) {
             known = known || name.rfind(prefix, 0) == 0;
@@ -1045,7 +1148,13 @@ int main(int, char **) {
     };
     std::atomic<bool> booted{ false };
     std::function<void()> boot_then = [&] {
-        boot();
+        try {
+            boot();
+        } catch (const std::exception & e) {
+            std::printf("ps5lm-app: boot failed: %s\n", e.what());
+        } catch (...) {
+            std::printf("ps5lm-app: boot failed: unknown exception\n");
+        }
         booted = true;
     };
     const pthread_t booting = start_thread(boot_then);
@@ -1103,6 +1212,18 @@ int main(int, char **) {
     for (uint64_t n = 0;; ++n) {
         if (restart_at == 0 && access(kQuit, F_OK) != 0) {
             poll_storage_probe_worker();
+            if (poll_console_probe()) {
+                if (g_console_probe.saved) {
+                    notify("Console probe saved to /data/PS5LM/probe.json. Restarting...");
+                } else {
+                    notify(("Console probe failed: " + g_console_probe.error).c_str());
+                }
+                // The probe must restart without a manual app-args.txt override.
+                unlink(kArgs);
+                std::ofstream(kChoice) << "none\n";
+                dash.set_busy("Console probe complete", "The app restarts without a model");
+                restart_at = n + 3;
+            }
         }
         const int64_t now = hui::sys::monotonic_us();
         const float dt = n == 0 ? 1.0f / 60.0f : std::min(0.05f, (float) (now - last) / 1e6f);
@@ -1307,24 +1428,15 @@ int main(int, char **) {
         if (req.kind == Dashboard::Request::probe_console) {
             if (!models.running.empty() || models.server_started) {
                 notify("Unload the current model before probing the console.");
+            } else if (g_console_probe.active.load(std::memory_order_acquire)) {
+                notify("A console probe is already running.");
             } else {
                 cancel_storage_probe("console probe");
-                dash.set_busy("Probing this console", "Measuring memory and bandwidth...");
-                if (ui_ok) {
-                    render();
-                    display.swap();
+                if (start_console_probe()) {
+                    dash.set_busy("Probing this console", "Measuring memory and bandwidth...");
+                } else {
+                    notify("The console probe could not start; see app.log.");
                 }
-                ProbeReport rep = run_console_probe([&](const char * phase) {
-                    std::printf("ps5lm-app: probe: %s\n", phase);
-                });
-                std::string err;
-                if (!write_probe_report("/data/PS5LM/probe.json", rep, &err)) {
-                    std::printf("ps5lm-app: probe report failed: %s\n", err.c_str());
-                }
-                notify("Console probe saved to /data/PS5LM/probe.json. Restarting...");
-                std::ofstream(kChoice) << "none\n";
-                dash.set_busy("Console probe complete", "The app restarts without a model");
-                restart_at = n + 3;
             }
         }
         // The same requests from the PC (scripts/ps5lm-app.sh load|unload).
@@ -1336,9 +1448,25 @@ int main(int, char **) {
             } else if (!take_request_file("/data/PS5LM/probe").empty()) {
                 req = { Dashboard::Request::probe_console, "" };
             } else if (std::string u = take_request_file("/data/PS5LM/fetch"); !u.empty()) {
-                std::thread(probe_fetch, u).detach();
+                std::thread([u] {
+                    try {
+                        probe_fetch(u);
+                    } catch (const std::exception & e) {
+                        std::printf("ps5lm-app: fetch probe failed: %s\n", e.what());
+                    } catch (...) {
+                        std::printf("ps5lm-app: fetch probe failed: unknown exception\n");
+                    }
+                }).detach();
             } else if (!take_request_file("/data/PS5LM/bench-write").empty()) {
-                std::thread(probe_write).detach();
+                std::thread([] {
+                    try {
+                        probe_write();
+                    } catch (const std::exception & e) {
+                        std::printf("ps5lm-app: write probe failed: %s\n", e.what());
+                    } catch (...) {
+                        std::printf("ps5lm-app: write probe failed: unknown exception\n");
+                    }
+                }).detach();
             } else if (std::string p = take_request_line(kStorageProbeRequest, STORAGE_PROBE_MAX_PATH_BYTES); !p.empty()) {
                 if (p.size() == 1 && p[0] == '\1') {
                     std::printf("ps5lm-app: storage-probe request is too long or has multiple lines\n");
@@ -1355,6 +1483,11 @@ int main(int, char **) {
             } else if (std::string q = take_request_file("/data/PS5LM/search"); !q.empty()) {
                 market.search(q == "-" ? std::string() : q);  // a query typed on the PC
             }
+        }
+        if ((req.kind == Dashboard::Request::unload || req.kind == Dashboard::Request::load) &&
+            g_console_probe.active.load(std::memory_order_acquire)) {
+            notify("Wait for the console probe to finish before loading a model.");
+            req = { Dashboard::Request::none, "" };
         }
         if (req.kind == Dashboard::Request::unload || req.kind == Dashboard::Request::load) {
             // Unloading in place leaves part of the model's GPU memory held
